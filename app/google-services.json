@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "816085499625",
+    "firebase_url": "https://com-example-firstapp-e2783-default-rtdb.firebaseio.com",
+    "project_id": "com-example-firstapp-e2783",
+    "storage_bucket": "com-example-firstapp-e2783.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:816085499625:android:e776a2f577fdab7b4aba78",
+        "android_client_info": {
+          "package_name": "Com.example.attendance"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "816085499625-csl6nvunk2qv64ccpctefumbpt3sshic.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "Com.example.attendance",
+            "certificate_hash": "64766090030cd6239eefdcac854bbd729cab2b9e"
+          }
+        },
+        {
+          "client_id": "816085499625-4a5t566tustbc5hcm6bc0ghb2jpsisko.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBBvAkgieOZBxhx5p3soDfOP5bI2ERxp6o"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "816085499625-4a5t566tustbc5hcm6bc0ghb2jpsisko.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
