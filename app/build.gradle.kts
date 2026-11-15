@@ -6,11 +6,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.attendance"
+    namespace = "com.bunkr.attendance"
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "Com.example.attendance"
+        applicationId = "com.bunkr.attendance"
         minSdk = 26
         targetSdk = 37
         versionCode = 1
@@ -19,9 +19,22 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        create("release") {
+            storeFile = file("${rootDir}/keystore/release.jks")
+            storePassword = "password123"
+            keyAlias = "releasekey"
+            keyPassword = "password123"
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("release")
+        }
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

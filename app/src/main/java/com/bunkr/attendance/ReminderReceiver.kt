@@ -1,4 +1,4 @@
-package com.example.attendance
+package com.bunkr.attendance
 
 import android.content.BroadcastReceiver
 import android.content.Context

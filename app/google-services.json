@@ -42,6 +42,51 @@
           ]
         }
       }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:816085499625:android:8bf4d96d1b69eab84aba78",
+        "android_client_info": {
+          "package_name": "com.bunkr.attendance"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "816085499625-36l4n7nimvbgaijve1cc21q8cs0oe54j.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.bunkr.attendance",
+            "certificate_hash": "32d31c92bdc58d0cb79402fab128bcf0ba4e2582"
+          }
+        },
+        {
+          "client_id": "816085499625-jeb5huqck308nol9ct5c7f806g4o8gkk.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.bunkr.attendance",
+            "certificate_hash": "64766090030cd6239eefdcac854bbd729cab2b9e"
+          }
+        },
+        {
+          "client_id": "816085499625-4a5t566tustbc5hcm6bc0ghb2jpsisko.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBBvAkgieOZBxhx5p3soDfOP5bI2ERxp6o"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "816085499625-4a5t566tustbc5hcm6bc0ghb2jpsisko.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
     }
   ],
   "configuration_version": "1"

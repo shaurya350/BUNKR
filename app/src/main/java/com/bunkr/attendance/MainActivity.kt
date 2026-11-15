@@ -1,4 +1,4 @@
-package com.example.attendance // <-- change to your own package name
+package com.bunkr.attendance // <-- change to your own package name
 
 import android.content.Context
 import android.Manifest
@@ -11,6 +11,8 @@ import android.app.TimePickerDialog
 import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -25,7 +27,43 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Outline
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.foundation.Canvas
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -45,8 +83,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -57,6 +97,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.credentials.CredentialManager
@@ -85,6 +126,8 @@ val Lime = Color(0xFFB8F34A)
 val Sky = Color(0xFF6BB5FF)
 val Red = Color(0xFFFF5C5C)
 val White = Color(0xFFFFFFFF)
+val Mint = Color(0xFF70E8BA) // from the BUNKR logo
+val Lavender = Color(0xFFC7B8FF) // header background
 
 // ---------- Data ----------
 /** Attendance numbers for ONE section (theory or lab). */
@@ -253,6 +296,15 @@ class SubjectStore(context: Context, uid: String) {
         prefs.edit().putString(key, encode(data)).apply()
     }
 
+    /** Calls [onChange] when the saved data changes (e.g. from a notification button). Returns a function that stops listening. */
+    fun listenForChanges(onChange: () -> Unit): () -> Unit {
+        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, k ->
+            if (k == key) onChange()
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        return { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+
     /** Backs up to Firestore. Works offline too: Firestore queues it and uploads when online. */
     fun saveCloud(data: AppData, onDone: (Boolean) -> Unit) {
         doc.set(mapOf("subjects" to encode(data))).addOnCompleteListener { onDone(it.isSuccessful) }
@@ -358,6 +410,7 @@ class MainActivity : ComponentActivity() {
             val current = user
             val logout = {
                 Reminders.clear(applicationContext)
+                ClassEndAlerts.clear(applicationContext)
                 Firebase.auth.signOut()
                 user = null
                 verified = false
@@ -369,7 +422,7 @@ class MainActivity : ComponentActivity() {
                 })
                 // Fake or mistyped emails can never open the app: the inbox owner must click the link first.
                 !verified -> VerifyEmailScreen(current, onVerified = { verified = true }, onLogout = logout)
-                else -> BunkWiseApp(user = current, onLogout = logout)
+                else -> BunkrApp(user = current, onLogout = logout)
             }
         }
     }
@@ -500,6 +553,820 @@ fun FieldLabel(text: String) {
     Text(text, fontWeight = FontWeight.Black, fontSize = 12.sp, color = Ink)
     Spacer(Modifier.height(4.dp))
 }
+
+// ---------- Bunkr logo + attendance gauge ----------
+private fun Path.quad(x0: Float, y0: Float, x1: Float, y1: Float, x2: Float, y2: Float) {
+    cubicTo(
+        x0 + 2f / 3f * (x1 - x0), y0 + 2f / 3f * (y1 - y0),
+        x2 + 2f / 3f * (x1 - x2), y2 + 2f / 3f * (y1 - y2),
+        x2, y2
+    )
+}
+
+/** The app logo: mint tile, blocky B and a little progress bar. Drawn on a 60 x 60 grid. */
+@Composable
+fun BunkrLogo(logoSize: Dp, modifier: Modifier = Modifier) {
+    Canvas(modifier.size(logoSize)) {
+        val mint = Color(0xFF70E8BA)
+        scale(this.size.minDimension / 60f, Offset.Zero) {
+            drawRect(Ink, Offset(2f, 8f), Size(50f, 50f))
+            drawRect(mint, Offset(8f, 3f), Size(49f, 49f))
+            drawRect(Ink, Offset(8f, 3f), Size(49f, 49f), style = Stroke(3.5f))
+            drawRect(Ink, Offset(13f, 8f), Size(39f, 39f), style = Stroke(1.5f))
+
+            val b = Path().apply {
+                moveTo(21f, 11f)
+                lineTo(37f, 11f)
+                quad(37f, 11f, 42.5f, 11f, 42.5f, 16.2f)
+                quad(42.5f, 16.2f, 42.5f, 19.6f, 39.8f, 21.2f)
+                quad(39.8f, 21.2f, 44f, 22.8f, 44f, 27.6f)
+                quad(44f, 27.6f, 44f, 33f, 38f, 33f)
+                lineTo(21f, 33f)
+                close()
+            }
+            drawPath(b, Ink)
+            val hole1 = Path().apply {
+                moveTo(27f, 15.4f)
+                lineTo(34.2f, 15.4f)
+                quad(34.2f, 15.4f, 36.6f, 15.4f, 36.6f, 17.4f)
+                quad(36.6f, 17.4f, 36.6f, 19.4f, 34.2f, 19.4f)
+                lineTo(27f, 19.4f)
+                close()
+            }
+            val hole2 = Path().apply {
+                moveTo(27f, 24.2f)
+                lineTo(35.4f, 24.2f)
+                quad(35.4f, 24.2f, 38f, 24.2f, 38f, 26.8f)
+                quad(38f, 26.8f, 38f, 29.4f, 35.4f, 29.4f)
+                lineTo(27f, 29.4f)
+                close()
+            }
+            drawPath(hole1, mint)
+            drawPath(hole2, mint)
+
+            drawRect(White, Offset(19f, 37f), Size(28f, 6f))
+            drawRect(Ink, Offset(19f, 37f), Size(28f, 6f), style = Stroke(1.6f))
+            drawRect(Color(0xFFC8F04A), Offset(19.8f, 37.8f), Size(17f, 4.4f))
+        }
+    }
+}
+
+/** Little dial (red / white / green) whose needle sweeps up when it first appears. */
+@Composable
+private fun AttendanceGauge(modifier: Modifier = Modifier) {
+    val sweep = remember { Animatable(-85f) }
+    LaunchedEffect(Unit) { sweep.animateTo(0f, tween(1100)) }
+    Canvas(modifier.size(width = 86.dp, height = 58.dp)) {
+        scale(this.size.width / 86f, Offset.Zero) {
+            val arcTop = Offset(8f, 13f)
+            val arcSize = Size(70f, 70f)
+            drawArc(Ink, 180f, 180f, false, topLeft = arcTop, size = arcSize, style = Stroke(15f))
+            drawArc(Red, 180f, 60f, false, topLeft = arcTop, size = arcSize, style = Stroke(9f))
+            drawArc(White, 240f, 60f, false, topLeft = arcTop, size = arcSize, style = Stroke(9f))
+            drawArc(Green, 300f, 60f, false, topLeft = arcTop, size = arcSize, style = Stroke(9f))
+            rotate(sweep.value, Offset(43f, 48f)) {
+                drawLine(Ink, Offset(43f, 48f), Offset(66f, 28f), strokeWidth = 4f, cap = StrokeCap.Round)
+            }
+            drawCircle(Ink, 6f, Offset(43f, 48f))
+            drawCircle(Yellow, 2.2f, Offset(43f, 48f))
+        }
+    }
+}
+
+// ---------- App header (ticket) ----------
+private val Green = Color(0xFF4DD672)
+// Ticket header colours: change these five lines to re-theme the header
+private val TicketTop = Color(0xFFB8F34A)
+private val TicketBottom = Color(0xFFC7B8FF)
+private val TicketTile = Color(0xFF54FF93)
+private val TicketAvatar = Color(0xFF00FFBF)
+private val TicketStrip = Color(0xFF12FFE3)
+// BUNKR letter colours: B U N K R
+private val WordColors = listOf(
+    Color(0xFFFFF4E0), Color(0xFFFFF4E0), Color(0xFFFFF4E0), Color(0xFFFFF4E0), Color(0xFFFFF4E0)
+)
+
+private fun syncColor(status: String): Color = when (status) {
+    "SYNCED" -> Lime
+    "SYNCING..." -> Sky
+    "OFFLINE", "SYNC FAILED" -> Red
+    else -> White
+}
+
+/** Round status light. Pulses while a sync is running. */
+@Composable
+private fun SyncDot(
+    color: Color,
+    pulsing: Boolean,
+    modifier: Modifier = Modifier,
+    dotSize: Dp = 14.dp,
+    shadow: Boolean = false
+) {
+    val dotAlpha = if (pulsing) {
+        val transition = rememberInfiniteTransition(label = "syncPulse")
+        transition.animateFloat(
+            initialValue = 0.25f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(tween(600), RepeatMode.Reverse),
+            label = "syncPulseAlpha"
+        ).value
+    } else 1f
+    Box(
+        modifier
+            .size(dotSize)
+            .graphicsLayer { alpha = dotAlpha }
+            .drawBehind {
+                if (shadow) drawCircle(Ink, size.minDimension / 2, center + Offset(2.dp.toPx(), 2.dp.toPx()))
+            }
+            .background(color, CircleShape)
+            .border(2.dp, Ink, CircleShape)
+    )
+}
+
+/** Ticket outline: square top corners, a semicircle notch on each side at [notchY], zig-zag torn bottom. */
+private fun ticketPath(size: Size, notchY: Float, d: Density): Path {
+    val r = with(d) { 13.dp.toPx() }
+    val zig = with(d) { 12.dp.toPx() }
+    val w = size.width
+    val h = size.height
+    val teeth = (w / with(d) { 16.dp.toPx() }).toInt().coerceAtLeast(8)
+    val tw = w / teeth
+    return Path().apply {
+        moveTo(0f, 0f)
+        lineTo(w, 0f)
+        lineTo(w, notchY - r)
+        arcTo(Rect(w - r, notchY - r, w + r, notchY + r), 270f, -180f, false)
+        lineTo(w, h - zig)
+        for (i in 0 until teeth) {
+            lineTo(w - (i + 0.5f) * tw, h)
+            lineTo(w - (i + 1f) * tw, h - zig)
+        }
+        lineTo(0f, notchY + r)
+        arcTo(Rect(-r, notchY - r, r, notchY + r), 90f, -180f, false)
+        close()
+    }
+}
+
+private class TicketShape(private val notchY: Float) : Shape {
+    override fun createOutline(size: Size, layoutDirection: LayoutDirection, density: Density): Outline =
+        Outline.Generic(ticketPath(size, if (notchY > 0f) notchY else size.height * 0.5f, density))
+}
+
+/** BUNKR: multicolour letters with a black outline and hard shadow, one equal slot per letter. */
+@Composable
+private fun BunkrWordmark(glyph: Float = 46f, colors: List<Color> = WordColors) {
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val slot = maxWidth.value / 5f
+        // a glyph is ~0.7em wide; stretch it sideways until it fills its slot
+        val stretch = ((slot - 6f) / (0.7f * glyph)).coerceIn(0.9f, 2f)
+        val fontSize = with(LocalDensity.current) { glyph.dp.toSp() }
+        Row(Modifier.fillMaxWidth()) {
+            "BUNKR".forEachIndexed { i, ch ->
+                Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                    Box(Modifier.graphicsLayer { scaleX = stretch }) {
+                        Text(
+                            ch.toString(),
+                            color = Ink,
+                            fontSize = fontSize,
+                            lineHeight = fontSize,
+                            fontWeight = FontWeight.Black,
+                            style = TextStyle(
+                                drawStyle = Stroke(width = 12f, join = StrokeJoin.Round),
+                                shadow = Shadow(Ink, Offset(6f, 6f), 0f)
+                            )
+                        )
+                        Text(
+                            ch.toString(),
+                            color = colors[i],
+                            fontSize = fontSize,
+                            lineHeight = fontSize,
+                            fontWeight = FontWeight.Black
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun InfoChip(text: String, modifier: Modifier) {
+    Text(
+        text,
+        modifier = modifier
+            .border(3.dp, Ink, RoundedCornerShape(10.dp))
+            .padding(horizontal = 10.dp, vertical = 9.dp),
+        color = Ink,
+        fontSize = 14.sp,
+        fontWeight = FontWeight.Black,
+        fontFamily = FontFamily.Monospace,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis
+    )
+}
+
+/**
+ * Ticket-style header. Green stub: Bunkr logo, account button with sync light, colourful BUNKR tiles and a tagline.
+ * Perforation line, then a lavender stub: overall % with a striped attendance bar and goal marker,
+ * the next-class card (time, countdown, room, teacher) and a status stamp with the semester name.
+ * The account button opens a dialog with the email, sync state and logout.
+ */
+@Composable
+private fun TicketHeader(
+    email: String,
+    syncStatus: String,
+    overallFraction: Float,
+    requiredFraction: Float,
+    overallText: String,
+    statusText: String,
+    statusColor: Color,
+    semesterName: String,
+    next: Pair<ClassSlot, Long>?,
+    onLogout: () -> Unit
+) {
+    var accountOpen by remember { mutableStateOf(false) }
+    var topPx by remember { mutableStateOf(0f) }
+    val initial = remember(email) { email.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "?" }
+    val shape = remember(topPx) { TicketShape(topPx) }
+
+    Box(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 4.dp)) {
+        Box(Modifier.padding(end = 6.dp, bottom = 6.dp)) {
+            Column(
+                Modifier
+                    .drawBehind {
+                        val ny = if (topPx > 0f) topPx else size.height * 0.5f
+                        translate(6.dp.toPx(), 6.dp.toPx()) { drawPath(ticketPath(size, ny, this@drawBehind), Ink) }
+                    }
+                    .clip(shape)
+                    .border(3.dp, Ink, shape)
+            ) {
+                // ----- green stub -----
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(TicketTop)
+                        .onSizeChanged { topPx = it.height.toFloat() }
+                        .drawBehind {
+                            val y = size.height - 1.5.dp.toPx()
+                            drawLine(
+                                Ink, Offset(16.dp.toPx(), y), Offset(size.width - 16.dp.toPx(), y),
+                                strokeWidth = 3.dp.toPx(),
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(18f, 12f))
+                            )
+                        }
+                ) {
+                    Box(Modifier.fillMaxWidth().height(8.dp).background(TicketStrip))
+                    Box(Modifier.fillMaxWidth().height(3.dp).background(Ink))
+                    Column(
+                        Modifier.padding(start = 14.dp, end = 14.dp, top = 10.dp, bottom = 14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            BunkrLogo(52.dp)
+                            Spacer(Modifier.weight(1f))
+                            Box(
+                                Modifier
+                                    .size(54.dp)
+                                    .clickable(role = Role.Button) { accountOpen = true }
+                            ) {
+                                Box(
+                                    Modifier
+                                        .align(Alignment.BottomStart)
+                                        .size(46.dp)
+                                        .drawBehind {
+                                            drawCircle(Ink, size.minDimension / 2, center + Offset(3.dp.toPx(), 3.dp.toPx()))
+                                        }
+                                        .background(Brush.linearGradient(listOf(Pink, Yellow)), CircleShape)
+                                        .drawBehind {
+                                            drawCircle(
+                                                White, 3.5.dp.toPx(),
+                                                Offset(size.width * 0.3f, size.height * 0.28f)
+                                            )
+                                        }
+                                        .border(3.dp, Ink, CircleShape),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(initial, fontSize = 21.sp, fontWeight = FontWeight.Black, color = Ink)
+                                }
+                                SyncDot(
+                                    color = syncColor(syncStatus),
+                                    pulsing = syncStatus == "syncing",
+                                    modifier = Modifier.align(Alignment.TopEnd),
+                                    dotSize = 18.dp,
+                                    shadow = true
+                                )
+                            }
+                        }
+
+                        // BUNKR as sticker tiles
+                        val tileColors = listOf(Sky, Yellow, Pink, White, Lavender)
+                        val tileRot = listOf(-5f, 3f, -2f, 5f, -4f)
+                        val tileShift = listOf(0f, -3f, 2f, -2f, 1f)
+                        val tileShape = RoundedCornerShape(10.dp)
+                        Row(
+                            Modifier.fillMaxWidth().padding(horizontal = 2.dp),
+                            horizontalArrangement = Arrangement.spacedBy(9.dp)
+                        ) {
+                            "BUNKR".forEachIndexed { i, ch ->
+                                Box(
+                                    Modifier
+                                        .weight(1f)
+                                        .aspectRatio(1f / 0.88f)
+                                        .graphicsLayer {
+                                            rotationZ = tileRot[i]
+                                            translationY = tileShift[i].dp.toPx()
+                                        }
+                                        .drawBehind {
+                                            drawRoundRect(
+                                                Ink, Offset(4.dp.toPx(), 4.dp.toPx()), size,
+                                                CornerRadius(10.dp.toPx())
+                                            )
+                                        }
+                                        .background(tileColors[i], tileShape)
+                                        .border(3.dp, Ink, tileShape),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(ch.toString(), fontSize = 34.sp, fontWeight = FontWeight.Black, color = Ink)
+                                }
+                            }
+                        }
+                        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                            Text(
+                                "SKIP SMART. STAY SAFE.",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Black,
+                                fontFamily = FontFamily.Monospace,
+                                letterSpacing = 2.sp,
+                                color = Cream,
+                                modifier = Modifier
+                                    .graphicsLayer { rotationZ = -1f }
+                                    .background(Ink, RoundedCornerShape(12.dp))
+                                    .padding(horizontal = 12.dp, vertical = 3.dp)
+                            )
+                        }
+                    }
+                }
+
+                // ----- lavender stub -----
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(TicketBottom)
+                        .padding(start = 14.dp, end = 14.dp, top = 12.dp, bottom = 22.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OverallBarCard(overallText, overallFraction, requiredFraction)
+                    NextClassCard(next)
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Box(Modifier.graphicsLayer { rotationZ = -6f }) {
+                            Text(
+                                statusText,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Black,
+                                color = Ink,
+                                modifier = Modifier
+                                    .drawBehind {
+                                        drawRect(Ink, Offset(3.dp.toPx(), 3.dp.toPx()), size)
+                                    }
+                                    .background(statusColor)
+                                    .border(3.dp, Ink)
+                                    .padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                        Text(
+                            semesterName.uppercase(),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Black,
+                            fontFamily = FontFamily.Monospace,
+                            color = Ink,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.End,
+                            modifier = Modifier.weight(1f).padding(start = 12.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    if (accountOpen) AccountDialog(email, syncStatus, { accountOpen = false }, onLogout)
+}
+
+/** Big overall % with a rounded striped bar. The black marker (and GOAL label) shows the required %. */
+@Composable
+private fun OverallBarCard(overallText: String, fraction: Float, required: Float) {
+    val reached = fraction >= required
+    val c1 = if (reached) Green else Red
+    val c2 = if (reached) Color(0xFF7BE899) else Color(0xFFFF8A8A)
+    val anim by animateFloatAsState(fraction.coerceIn(0f, 1f), tween(500), label = "overallBar")
+    val card = RoundedCornerShape(14.dp)
+    val track = RoundedCornerShape(12.dp)
+    Box(Modifier.fillMaxWidth().padding(end = 3.dp, bottom = 3.dp)) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .drawBehind {
+                    drawRoundRect(Ink, Offset(3.dp.toPx(), 3.dp.toPx()), size, CornerRadius(14.dp.toPx()))
+                }
+                .background(White, card)
+                .border(3.dp, Ink, card)
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                overallText,
+                fontSize = 30.sp,
+                fontWeight = FontWeight.Black,
+                fontFamily = FontFamily.Monospace,
+                color = Ink
+            )
+            Spacer(Modifier.width(12.dp))
+            BoxWithConstraints(Modifier.weight(1f)) {
+                val maxW = maxWidth
+                val wPx = constraints.maxWidth.toFloat()
+                var labelW by remember { mutableStateOf(0) }
+                Column {
+                    Box(Modifier.fillMaxWidth().height(16.dp)) {
+                        Text(
+                            "GOAL ${"%.0f".format(required * 100)}%",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Black,
+                            fontFamily = FontFamily.Monospace,
+                            color = Cream,
+                            maxLines = 1,
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .offset {
+                                    val x = (wPx * required - labelW / 2f).coerceIn(0f, (wPx - labelW).coerceAtLeast(0f))
+                                    IntOffset(x.toInt(), 0)
+                                }
+                                .onSizeChanged { labelW = it.width }
+                                .background(Ink, RoundedCornerShape(4.dp))
+                                .padding(horizontal = 5.dp, vertical = 1.dp)
+                        )
+                    }
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(24.dp)
+                            .clip(track)
+                            .background(White)
+                            .border(3.dp, Ink, track)
+                    ) {
+                        Box(
+                            Modifier
+                                .fillMaxHeight()
+                                .fillMaxWidth(anim)
+                                .drawBehind {
+                                    drawRect(c1)
+                                    val step = 16.dp.toPx()
+                                    val band = 8.dp.toPx()
+                                    val h = size.height
+                                    var x = -h
+                                    while (x < size.width) {
+                                        val p = Path().apply {
+                                            moveTo(x, h)
+                                            lineTo(x + band, h)
+                                            lineTo(x + band + h, 0f)
+                                            lineTo(x + h, 0f)
+                                            close()
+                                        }
+                                        drawPath(p, c2)
+                                        x += step
+                                    }
+                                    if (anim > 0f) drawRect(Ink, Offset(size.width - 3.dp.toPx(), 0f), Size(3.dp.toPx(), h))
+                                }
+                        )
+                        Box(
+                            Modifier
+                                .fillMaxHeight()
+                                .width(3.dp)
+                                .offset(x = maxW * required - 1.dp)
+                                .background(Ink)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** Next class: coloured start-time block, countdown pill, subject, teacher, type tag, room and length. */
+@Composable
+private fun NextClassCard(next: Pair<ClassSlot, Long>?) {
+    val shape = RoundedCornerShape(12.dp)
+    Box(Modifier.fillMaxWidth().padding(end = 3.dp, bottom = 3.dp)) {
+        if (next == null) {
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .drawBehind {
+                        drawRoundRect(
+                            Ink,
+                            cornerRadius = CornerRadius(12.dp.toPx()),
+                            style = Stroke(3.dp.toPx(), pathEffect = PathEffect.dashPathEffect(floatArrayOf(14f, 10f)))
+                        )
+                    }
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+            ) {
+                Text(
+                    "No upcoming classes. Add one in Timetable.",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Black,
+                    color = Ink
+                )
+            }
+        } else {
+            val (slot, at) = next
+            val now = System.currentTimeMillis()
+            val whenText = (if (dayLabel(at) == "TODAY") untilText(at, now) else dayLabel(at)).uppercase()
+            val typeColor = if (slot.isLab) Pink else Sky
+            val timeParts = formatTime(slot.start).split(" ")
+            val dur = slot.end - slot.start
+            val durText = when {
+                dur < 60 -> "$dur min"
+                dur % 60 == 0 -> "${dur / 60} hr"
+                else -> "${"%.1f".format(dur / 60f)} hr"
+            }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .height(IntrinsicSize.Min)
+                    .drawBehind {
+                        drawRoundRect(Ink, Offset(3.dp.toPx(), 3.dp.toPx()), size, CornerRadius(12.dp.toPx()))
+                    }
+                    .clip(shape)
+                    .background(White)
+                    .border(3.dp, Ink, shape)
+            ) {
+                Column(
+                    Modifier.width(72.dp).fillMaxHeight().background(typeColor),
+                    verticalArrangement = Arrangement.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        timeParts[0],
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Black,
+                        fontFamily = FontFamily.Monospace,
+                        color = Ink
+                    )
+                    Text(timeParts.getOrElse(1) { "" }, fontSize = 11.sp, fontWeight = FontWeight.Black, color = Ink)
+                }
+                Box(Modifier.width(3.dp).fillMaxHeight().background(Ink))
+                Column(
+                    Modifier.weight(1f).padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "NEXT CLASS",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Black,
+                            letterSpacing = 1.sp,
+                            color = Ink
+                        )
+                        Spacer(Modifier.weight(1f))
+                        if (whenText.isNotEmpty()) {
+                            Text(
+                                whenText,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Black,
+                                fontFamily = FontFamily.Monospace,
+                                color = Lime,
+                                maxLines = 1,
+                                modifier = Modifier
+                                    .background(Ink, RoundedCornerShape(10.dp))
+                                    .padding(horizontal = 8.dp, vertical = 1.dp)
+                            )
+                        }
+                    }
+                    Text(
+                        slot.subject,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Black,
+                        color = Ink,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (slot.teacher.isNotBlank()) {
+                        Text(
+                            slot.teacher,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Ink,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            if (slot.isLab) "LAB" else "THEORY",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Black,
+                            color = Ink,
+                            modifier = Modifier
+                                .background(typeColor)
+                                .border(2.dp, Ink)
+                                .padding(horizontal = 6.dp)
+                        )
+                        if (slot.room.isNotBlank()) {
+                            Text("Room ${slot.room}", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Ink)
+                        }
+                        Text(durText, fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Ink)
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+@Composable
+private fun AccountDialog(email: String, syncStatus: String, onDismiss: () -> Unit, onLogout: () -> Unit) {
+    Dialog(onDismissRequest = onDismiss) {
+        Box(Modifier.padding(end = 6.dp, bottom = 6.dp)) {
+            Column(
+                Modifier
+                    .neoShadow(6.dp)
+                    .background(Yellow)
+                    .border(3.dp, Ink)
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text("ACCOUNT", fontWeight = FontWeight.Black, fontSize = 22.sp, color = Ink)
+                Text(email, fontWeight = FontWeight.Bold, color = Ink)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SyncDot(syncColor(syncStatus), pulsing = syncStatus == "SYNCING...")
+                    Text(
+                        syncStatus.ifEmpty { "..." },
+                        fontWeight = FontWeight.Black,
+                        fontFamily = FontFamily.Monospace,
+                        color = Ink
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    NeoButton("CLOSE", White, Modifier.weight(1f)) { onDismiss() }
+                    NeoButton("LOG OUT", Red, Modifier.weight(1f)) {
+                        onDismiss()
+                        onLogout()
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------- Slim header (cream bar + mint stats strip) ----------
+private val SlimBar = Color(0xFFFFF4E0)
+private val SlimStrip = Color(0xFF9FE5C8)
+private val SlimTile = Color(0xFF70E8BA)
+private val SlimAvatar = Color(0xFFFF6B9D)
+private val SlimLetters = listOf(
+    Color(0xFF5C9DF5), Color(0xFFFFCE3A), Color(0xFFF4685B), Color(0xFFF77AAE), Color(0xFF62D9A3)
+)
+
+@Composable
+private fun SlimChip(text: String, modifier: Modifier) {
+    Text(
+        text,
+        modifier = modifier
+            .border(2.dp, Ink)
+            .padding(horizontal = 8.dp, vertical = 5.dp),
+        color = Ink,
+        fontSize = 11.sp,
+        fontWeight = FontWeight.Black,
+        fontFamily = FontFamily.Monospace,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis
+    )
+}
+
+/** Slim header: cream bar (B tile, coloured BUNKR, sync light, avatar) over a mint strip with the stats. */
+@Composable
+private fun SlimHeader(
+    email: String,
+    syncStatus: String,
+    overallFraction: Float,
+    requiredFraction: Float,
+    overallText: String,
+    safeText: String,
+    nextText: String,
+    onLogout: () -> Unit
+) {
+    var accountOpen by remember { mutableStateOf(false) }
+    val initial = remember(email) { email.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "?" }
+    val fill = if (overallFraction >= requiredFraction) Lime else Red
+
+    Box(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 4.dp)) {
+        Box(Modifier.padding(end = 6.dp, bottom = 6.dp)) {
+            Column(Modifier.neoShadow(6.dp).border(3.dp, Ink)) {
+                Row(
+                    Modifier.fillMaxWidth().background(SlimBar).padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(Modifier.padding(end = 3.dp, bottom = 3.dp)) {
+                        Column(
+                            Modifier.size(44.dp).neoShadow(3.dp).background(SlimTile).border(3.dp, Ink),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center
+                        ) {
+                            Text("B", color = Ink, fontSize = 20.sp, fontWeight = FontWeight.Black)
+                            Box(Modifier.width(22.dp).height(5.dp).background(White).border(1.5.dp, Ink)) {
+                                Box(Modifier.fillMaxHeight().fillMaxWidth(0.7f).background(Lime))
+                            }
+                        }
+                    }
+                    Box(Modifier.weight(1f).padding(horizontal = 10.dp), contentAlignment = Alignment.Center) {
+                        BunkrWordmark(glyph = 30f, colors = SlimLetters)
+                    }
+                    SyncDot(syncColor(syncStatus), pulsing = syncStatus == "SYNCING...")
+                    Spacer(Modifier.width(8.dp))
+                    Box(
+                        Modifier
+                            .size(40.dp)
+                            .drawBehind {
+                                drawCircle(
+                                    Ink,
+                                    radius = size.minDimension / 2,
+                                    center = center + Offset(2.dp.toPx(), 2.dp.toPx())
+                                )
+                            }
+                            .background(SlimAvatar, CircleShape)
+                            .border(3.dp, Ink, CircleShape)
+                            .clickable(role = Role.Button) { accountOpen = true },
+                        contentAlignment = Alignment.Center
+                    ) { Text(initial, fontWeight = FontWeight.Black, fontSize = 18.sp, color = Ink) }
+                }
+                Box(Modifier.fillMaxWidth().height(3.dp).background(Ink))
+                Column(
+                    Modifier.fillMaxWidth().background(SlimStrip).padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "$overallText OVERALL",
+                            color = Ink,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Black,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Box(Modifier.weight(1f).height(14.dp).background(White).border(2.dp, Ink)) {
+                            Box(Modifier.fillMaxHeight().fillMaxWidth(overallFraction.coerceIn(0f, 1f)).background(fill))
+                            Row(Modifier.fillMaxSize()) {
+                                Spacer(Modifier.weight(requiredFraction.coerceIn(0.001f, 1f)))
+                                Box(Modifier.width(3.dp).fillMaxHeight().background(Ink))
+                                if (requiredFraction < 1f) Spacer(Modifier.weight(1f - requiredFraction))
+                            }
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        SlimChip(safeText, Modifier.weight(0.8f))
+                        SlimChip(nextText.uppercase(), Modifier.weight(1.4f))
+                    }
+                }
+            }
+        }
+    }
+
+    if (accountOpen) AccountDialog(email, syncStatus, { accountOpen = false }, onLogout)
+}
+
+// ---------- Header switch ----------
+/** true = slim header (cream bar + mint strip), false = ticket header */
+private const val USE_SLIM_HEADER = false
+
+@Composable
+fun BunkrHeader(
+    email: String,
+    syncStatus: String,
+    overallFraction: Float,
+    requiredFraction: Float,
+    overallText: String,
+    safeText: String,
+    nextText: String,
+    onLogout: () -> Unit,
+    statusText: String = "",
+    statusColor: Color = White,
+    semesterName: String = "",
+    next: Pair<ClassSlot, Long>? = null
+) {
+    if (USE_SLIM_HEADER) {
+        SlimHeader(email, syncStatus, overallFraction, requiredFraction, overallText, safeText, nextText, onLogout)
+    } else {
+        TicketHeader(
+            email, syncStatus, overallFraction, requiredFraction, overallText,
+            statusText, statusColor, semesterName, next, onLogout
+        )
+    }
+}
+
 
 // ---------- ERP import: reading + parsing ----------
 data class ParsedRow(val name: String, val attended: Int, val total: Int, val isLab: Boolean)
@@ -677,10 +1544,26 @@ private fun rowsFromOcr(text: MlText): String {
     return rows.joinToString("\n") { r -> r.sortedBy { it.second.left }.joinToString(" ") { it.first.text } }
 }
 
+/** Small screenshots are enlarged first: the text reader loses tiny text (rooms, teachers, header times). */
+private fun loadForOcr(context: Context, uri: Uri): InputImage {
+    try {
+        val bmp = context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
+        if (bmp != null && bmp.width in 1..1799) {
+            val scale = minOf(3f, 2000f / bmp.width)
+            return InputImage.fromBitmap(
+                Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true), 0
+            )
+        }
+    } catch (e: Exception) {
+        // fall through to the normal loader
+    }
+    return InputImage.fromFilePath(context, uri)
+}
+
 /** On-device text recognition (ML Kit). The image never leaves the phone. */
 fun recognizeText(context: Context, uri: Uri, onDone: (String?) -> Unit) {
     try {
-        val image = InputImage.fromFilePath(context, uri)
+        val image = loadForOcr(context, uri)
         TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
             .process(image)
             .addOnSuccessListener { onDone(rowsFromOcr(it)) }
@@ -987,17 +1870,11 @@ object Reminders {
     }
 }
 
-
-
 /** Re-creates the alarm after a phone restart or an app update. */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        val action = intent.action
-        if (action == Intent.ACTION_BOOT_COMPLETED || 
-            action == Intent.ACTION_MY_PACKAGE_REPLACED || 
-            action == "android.intent.action.QUICKBOOT_POWERON") {
-            Reminders.scheduleNext(context)
-        }
+        Reminders.scheduleNext(context)
+        ClassEndAlerts.scheduleNext(context)
     }
 }
 
@@ -1129,7 +2006,7 @@ private fun boxesFromLine(line: MlText.Line): List<OcrBox> {
     for (w in line.elements.sortedBy { it.boundingBox?.left ?: 0 }) {
         val b = w.boundingBox ?: continue
         val prev = words.lastOrNull()?.boundingBox
-        if (prev != null && b.left - prev.right > 2.5 * maxOf(b.height(), prev.height())) flush()
+        if (prev != null && b.left - prev.right > 0.9 * maxOf(b.height(), prev.height())) flush()
         words.add(w)
     }
     flush()
@@ -1139,7 +2016,7 @@ private fun boxesFromLine(line: MlText.Line): List<OcrBox> {
 /** Like recognizeText, but also returns where each piece of text sits (needed for grid timetables). */
 fun recognizeLayout(context: Context, uri: Uri, onDone: (List<OcrBox>?, String?) -> Unit) {
     try {
-        val image = InputImage.fromFilePath(context, uri)
+        val image = loadForOcr(context, uri)
         TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
             .process(image)
             .addOnSuccessListener { t -> onDone(t.textBlocks.flatMap { it.lines }.flatMap { boxesFromLine(it) }, rowsFromOcr(t)) }
@@ -1219,50 +2096,109 @@ fun parseBatchTag(text: String): List<String>? {
     return null
 }
 
+/** What the grid reader found, plus the cells it skipped on purpose (BREAK, LIBRARY ...). */
+data class GridResult(val slots: List<ParsedSlot>, val skipped: List<String>)
+
+/** Height that separates big text (subjects) from small text (rooms, batches, teachers). 0 = no clear split. */
+private fun heightSplit(heights: List<Int>): Double {
+    val h = heights.filter { it >= 6 }.sorted()
+    if (h.size < 6) return 0.0
+    val p90 = h[minOf(h.size - 1, (h.size * 0.9).toInt())].toDouble()
+    var best = 1.0
+    var split = 0.0
+    for (i in 3..h.size - 3) {
+        val geo = Math.sqrt(h[i].toDouble() * h[i - 1])
+        if (geo < 0.35 * p90 || geo > 0.85 * p90) continue
+        val ratio = h[i].toDouble() / h[i - 1]
+        if (ratio > best) {
+            best = ratio
+            split = geo
+        }
+    }
+    return if (best >= 1.3) split else 0.0
+}
+
 /**
  * Reads a grid timetable from text positions:
- *  - the period times in the header row become the columns,
- *  - the day names on the left become the rows,
- *  - big text inside a cell is the subject, small text is the room, the batch (CSE H1 / H2) or the teacher,
+ *  - the period times in the header row become the columns (a column whose time was not read is filled in),
+ *  - the day names on the left become the rows (a day whose name was not read is filled in),
+ *  - big text inside a cell is the subject, small text is the room, the batch (CSE H1 / A2 ...) or the teacher,
  *  - a subject centred on the line between two periods (a lab) covers both periods.
  */
-fun parseTimetableGrid(boxes: List<OcrBox>): List<ParsedSlot> {
-    class Col(val start: Int, val end: Int, val cx: Int)
+fun parseTimetableGrid(boxes: List<OcrBox>): GridResult {
+    val none = GridResult(emptyList(), emptyList())
+    class Col(val start: Int, val end: Int, val cx: Double)
 
     // 1. columns
     val headerHits = boxes.mapNotNull { b ->
         val g = timeRangeRegex.find(b.text)?.groupValues ?: return@mapNotNull null
         val r = toRange(g[1], g[2], g[3], g[4], g[5], g[6]) ?: return@mapNotNull null
-        Triple(Col(r.first, r.second, b.cx), b.cy, b.bottom)
+        Triple(Col(r.first, r.second, b.cx.toDouble()), b.cy, b.bottom)
     }
-    if (headerHits.size < 3) return emptyList()
+    if (headerHits.size < 3) return none
     val headerY = headerHits.map { it.second }.sorted()[headerHits.size / 2]
     val header = headerHits.filter { Math.abs(it.second - headerY) < 25 }.sortedBy { it.first.cx }
-    val cols = ArrayList<Col>()
-    for (h in header) if (cols.isEmpty() || h.first.cx - cols.last().cx > 20) cols.add(h.first)
-    if (cols.size < 3) return emptyList()
+    val read = ArrayList<Col>()
+    for (h in header) if (read.isEmpty() || h.first.cx - read.last().cx > 20) read.add(h.first)
+    if (read.size < 3) return none
     val headerBottom = header.maxOf { it.third }
-    val colW = (cols.last().cx - cols.first().cx).toDouble() / (cols.size - 1)
+    val colW = read.zipWithNext { a, b -> b.cx - a.cx }.sorted().let { it[it.size / 2] }
+
+    val cols = ArrayList<Col>()
+    for (i in read.indices) {
+        cols.add(read[i])
+        if (i == read.size - 1) break
+        val n = Math.round((read[i + 1].cx - read[i].cx) / colW).toInt()
+        if (n > 1) { // time text of the columns in between was not read: estimate it from the neighbours
+            val span = read[i + 1].start - read[i].end
+            val len = if (span > 0) span / (n - 1) else read[i].end - read[i].start
+            for (k in 1 until n) {
+                val st = read[i].end + (k - 1) * len
+                cols.add(Col(st, st + len, read[i].cx + k * (read[i + 1].cx - read[i].cx) / n))
+            }
+        }
+    }
     val gridLeft = cols.first().cx - colW / 2
     val gridRight = cols.last().cx + colW / 2
 
     // 2. rows
-    val dayRows = mutableListOf<Pair<Int, Int>>() // day number to its vertical position
+    val seen = mutableListOf<Triple<Int, Int, Int>>() // day number, vertical position, label height
     for (b in boxes.sortedBy { it.cy }) {
         if (b.cx >= gridLeft || b.cy <= headerBottom) continue
-        val d = dayFromLabel(b.text) ?: continue
-        if (dayRows.none { it.first == d }) dayRows.add(d to b.cy)
+        val day = dayFromLabel(b.text) ?: continue
+        if (seen.none { it.first == day }) seen.add(Triple(day, b.cy, b.height))
     }
-    if (dayRows.isEmpty()) return emptyList()
-    val rowH = if (dayRows.size > 1) (dayRows.last().second - dayRows.first().second).toDouble() / (dayRows.size - 1) else colW
+    if (seen.isEmpty()) return none
+    val perRow = seen.zipWithNext().filter { (a, b) -> b.first > a.first }
+        .map { (a, b) -> (b.second - a.second).toDouble() / (b.first - a.first) }.sorted()
+    val rowH = if (perRow.isNotEmpty()) perRow[perRow.size / 2] else colW
+    val labelH = seen.map { it.third }.sorted()[seen.size / 2]
+    fun yFor(day: Int): Double {
+        val a = seen.minByOrNull { Math.abs(it.first - day) }!!
+        return a.second + (day - a.first) * rowH
+    }
+    val dayRows = ArrayList<Pair<Int, Double>>()
+    for (day in seen.minOf { it.first }..seen.maxOf { it.first }) dayRows.add(day to yFor(day)) // fills unread day names
+    val inGrid = boxes.filter { it.cx > gridLeft && it.cx < gridRight && it.cy > headerBottom }
+    fun hasBigText(y: Double) = inGrid.any { Math.abs(it.cy - y) < rowH / 2 && it.height >= 0.6 * labelH }
+    var before = dayRows.first().first - 1
+    while (before >= 1 && hasBigText(yFor(before))) {
+        dayRows.add(0, before to yFor(before))
+        before--
+    }
+    var after = dayRows.last().first + 1
+    while (after <= 7 && hasBigText(yFor(after))) {
+        dayRows.add(after to yFor(after))
+        after++
+    }
     val gridBottom = dayRows.last().second + rowH / 2
     fun dayAt(y: Int) = dayRows.minByOrNull { Math.abs(it.second - y) }!!.first
 
     // 3. text inside the grid
     val content = boxes.filter { it.cx > gridLeft && it.cx < gridRight && it.cy > headerBottom && it.cy < gridBottom }
-    if (content.isEmpty()) return emptyList()
+    if (content.isEmpty()) return none
     val heights = content.map { it.height }.sorted()
-    val bigH = heights[(heights.size * 0.85).toInt().coerceAtMost(heights.size - 1)]
+    val split = heightSplit(heights).let { if (it > 0) it else 0.6 * heights[minOf(heights.size - 1, (heights.size * 0.85).toInt())] }
     val defaultRoom = boxes.firstOrNull {
         it.cy < headerY - 5 && Regex("""(?i)^(?:LH|LT|RM|ROOM)\s*-?\s*\d+[A-Z]?$""").matches(it.text.trim())
     }?.text?.trim() ?: ""
@@ -1273,21 +2209,43 @@ fun parseTimetableGrid(boxes: List<OcrBox>): List<ParsedSlot> {
         val teacher = mutableListOf<String>()
     }
 
-    val placed = content.filter { it.height >= 0.6 * bigH && it.text.count { c -> c.isLetter() } >= 2 }.map { b ->
+    val first = content.filter { it.height >= split && it.text.count { c -> c.isLetter() } >= 2 }.map { b ->
         val t = (b.cx - cols.first().cx) / colW
         val fl = Math.floor(t).toInt()
         val onBoundary = (t - fl) in 0.3..0.7 // centred between two periods: a lab covering both
-        val first = (if (onBoundary) fl else Math.round(t).toInt()).coerceIn(0, cols.size - 1)
-        val last = (if (onBoundary) fl + 1 else first).coerceIn(first, cols.size - 1)
-        Placed(b, dayAt(b.cy), first, last)
+        val c0 = (if (onBoundary) fl else Math.round(t).toInt()).coerceIn(0, cols.size - 1)
+        val c1 = (if (onBoundary) fl + 1 else c0).coerceIn(c0, cols.size - 1)
+        Placed(b, dayAt(b.cy), c0, c1)
+    }
+
+    // a long subject name that wraps onto two lines inside one cell is one subject
+    val placed = mutableListOf<Placed>()
+    for (p in first.sortedWith(compareBy({ it.day }, { it.c0 }, { it.c1 }, { it.box.cy }))) {
+        val prev = placed.lastOrNull()
+        if (prev != null && prev.day == p.day && prev.c0 == p.c0 && prev.c1 == p.c1 &&
+            p.box.top - prev.box.bottom < 0.6 * minOf(p.box.height, prev.box.height) &&
+            Math.abs(p.box.cx - prev.box.cx) < 0.35 * colW
+        ) {
+            val a = prev.box
+            val b = p.box
+            placed[placed.lastIndex] = Placed(
+                OcrBox(
+                    a.text + " " + b.text,
+                    minOf(a.left, b.left), minOf(a.top, b.top), maxOf(a.right, b.right), maxOf(a.bottom, b.bottom)
+                ),
+                p.day, p.c0, p.c1
+            )
+        } else {
+            placed.add(p)
+        }
     }
 
     // 4. attach rooms, batches and teachers to the nearest subject in the same cell
     val roomRegex = Regex("""^\d{2,4}[A-Za-z]?$""")
-    for (s in content.filter { it.height < 0.6 * bigH }) {
-        val d = dayAt(s.cy)
+    for (s in content.filter { it.height < split }) {
+        val day = dayAt(s.cy)
         val owner = placed
-            .filter { it.day == d && s.cx >= gridLeft + it.c0 * colW && s.cx <= gridLeft + (it.c1 + 1) * colW }
+            .filter { it.day == day && s.cx >= gridLeft + it.c0 * colW && s.cx <= gridLeft + (it.c1 + 1) * colW }
             .minByOrNull { Math.abs(it.box.cy - s.cy) } ?: continue
         val text = s.text.trim()
         val batch = parseBatchTag(text)
@@ -1299,9 +2257,13 @@ fun parseTimetableGrid(boxes: List<OcrBox>): List<ParsedSlot> {
     }
 
     // 5. one entry per cell
-    return placed.mapNotNull { p ->
+    val skipped = mutableListOf<String>()
+    val slots = placed.mapNotNull { p ->
         val name = p.box.text.trim()
-        if (normName(name) in breakNames) return@mapNotNull null
+        if (normName(name) in breakNames) {
+            skipped.add(name.uppercase())
+            return@mapNotNull null
+        }
         val lab = labWord.containsMatchIn(name) || name.contains("practical", ignoreCase = true)
         val subject = displayName(name, lab)
         if (subject.count { it.isLetter() } < 2) return@mapNotNull null
@@ -1310,6 +2272,7 @@ fun parseTimetableGrid(boxes: List<OcrBox>): List<ParsedSlot> {
             p.groups.toList(), p.room.ifBlank { defaultRoom }, p.teacher.joinToString(", ")
         )
     }.sortedWith(compareBy({ it.day }, { it.start }))
+    return GridResult(slots, skipped)
 }
 
 // ---------- Timetable: screen ----------
@@ -1366,6 +2329,7 @@ fun TimetableScreen(slots: List<ClassSlot>, onEdit: (ClassSlot) -> Unit, onDelet
     var day by rememberSaveable { mutableStateOf(todayIndex()) }
     var enabled by remember { mutableStateOf(Reminders.enabled(context)) }
     var lead by remember { mutableStateOf(Reminders.lead(context)) }
+    var askAfter by remember { mutableStateOf(ClassEndAlerts.enabled(context)) }
     var blocked by remember { mutableStateOf(false) }
 
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -1382,12 +2346,12 @@ fun TimetableScreen(slots: List<ClassSlot>, onEdit: (ClassSlot) -> Unit, onDelet
 
     val daySlots = slots.filter { it.day == day }.sortedBy { it.start }
 
-    LazyColumn(
-        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 120.dp),
+    Column(
+        Modifier.padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 120.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {
         // Next class
-        item {
+        run {
             NeoCard(color = Lime) {
                 Text("NEXT CLASS", fontWeight = FontWeight.Black, fontSize = 14.sp)
                 if (next == null) {
@@ -1409,7 +2373,7 @@ fun TimetableScreen(slots: List<ClassSlot>, onEdit: (ClassSlot) -> Unit, onDelet
         }
 
         // Reminder settings
-        item {
+        run {
             NeoCard(color = Yellow) {
                 Text("CLASS REMINDERS", fontWeight = FontWeight.Black, fontSize = 14.sp)
                 Spacer(Modifier.height(10.dp))
@@ -1451,25 +2415,62 @@ fun TimetableScreen(slots: List<ClassSlot>, onEdit: (ClassSlot) -> Unit, onDelet
                         }
                     }
                 }
+
+                Spacer(Modifier.height(10.dp))
+                CheckRow("ASK ME TO MARK ATTENDANCE AFTER CLASS", askAfter) {
+                    val turnOn = !askAfter
+                    askAfter = turnOn
+                    if (turnOn && Build.VERSION.SDK_INT >= 33 &&
+                        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+                        PackageManager.PERMISSION_GRANTED
+                    ) permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    ClassEndAlerts.setEnabled(context, turnOn)
+                    ClassEndAlerts.scheduleNext(context)
+                }
+                // The notes above only show when the before-class reminder is on, so repeat them for this toggle.
+                if (askAfter && !enabled) {
+                    if (blocked) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "Notifications are blocked for this app. Turn them on in your phone's Settings > Apps > Notifications.",
+                            fontWeight = FontWeight.Bold, fontSize = 13.sp
+                        )
+                    }
+                    if (!Reminders.canScheduleExact(context)) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "For on-time alerts, allow exact alarms for this app.",
+                            fontWeight = FontWeight.Bold, fontSize = 13.sp
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        NeoButton("ALLOW EXACT ALARMS", White) {
+                            context.startActivity(
+                                Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:${context.packageName}"))
+                            )
+                        }
+                    }
+                }
             }
         }
 
         // Day selector
-        item {
+        run {
             LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 items((1..7).toList()) { d -> SemChip(DAY_SHORT[d - 1], d == day, Sky) { day = d } }
             }
         }
 
         if (daySlots.isEmpty()) {
-            item {
+            run {
                 NeoCard(color = Sky) {
                     Text("NO CLASSES ON ${DAY_FULL[day - 1].uppercase()}", fontWeight = FontWeight.Black, fontSize = 16.sp)
                 }
             }
         }
-        items(daySlots, key = { it.id }) { slot ->
-            SlotCard(slot, onEdit = { onEdit(slot) }, onDelete = { onDelete(slot) })
+        daySlots.forEach { slot ->
+            key(slot.id) {
+                SlotCard(slot, onEdit = { onEdit(slot) }, onDelete = { onDelete(slot) })
+            }
         }
     }
 }
@@ -1599,12 +2600,13 @@ fun TimetableImportDialog(
     var pasting by remember { mutableStateOf(false) }
     var pasteText by remember { mutableStateOf("") }
     var group by remember { mutableStateOf("") } // your batch, e.g. A1 or H2; "" = show every batch
+    var skipped by remember { mutableStateOf("") }
 
     fun handleSlots(parsed: List<ParsedSlot>) {
         loading = false
         if (parsed.isEmpty()) {
-            status = "Couldn't read any classes. Try a clearer, straight-on screenshot of the whole timetable, " +
-                    "or add classes with + ADD CLASS."
+            status = "Couldn't read the timetable. Use a sharp screenshot of the whole table that includes the " +
+                    "period times at the top and the day names on the left, or add classes with + ADD CLASS."
             return
         }
         // "BEEE" becomes "Basic Electrical and electronic Engineering" when you already track that subject
@@ -1617,6 +2619,7 @@ fun TimetableImportDialog(
     }
 
     fun handleText(text: String?) {
+        skipped = ""
         handleSlots(if (text.isNullOrBlank()) emptyList() else parseTimetableText(text))
     }
 
@@ -1625,8 +2628,13 @@ fun TimetableImportDialog(
             loading = true
             status = null
             recognizeLayout(context, uri) { boxes, text ->
-                val grid = if (boxes != null) parseTimetableGrid(boxes) else emptyList()
-                if (grid.isNotEmpty()) handleSlots(grid) else handleText(text)
+                val grid = if (boxes != null) parseTimetableGrid(boxes) else null
+                if (grid != null && grid.slots.isNotEmpty()) {
+                    skipped = grid.skipped.groupingBy { it }.eachCount().entries.joinToString(", ") { "${it.key} x${it.value}" }
+                    handleSlots(grid.slots)
+                } else {
+                    handleText(text)
+                }
             }
         }
     }
@@ -1697,6 +2705,15 @@ fun TimetableImportDialog(
                     }
 
                     Text("REVIEW (${shown.count { it.selected }}/${shown.size} selected)", fontWeight = FontWeight.Black)
+                    val perDay = shown.groupingBy { it.slot.day }.eachCount()
+                    Text(
+                        "Classes found:  " + DAY_SHORT.indices.filter { (it + 1) in perDay }
+                            .joinToString("   ") { "${DAY_SHORT[it]} ${perDay[it + 1]}" },
+                        fontWeight = FontWeight.Black, fontSize = 13.sp
+                    )
+                    if (skipped.isNotEmpty()) {
+                        Text("Skipped (not classes): $skipped", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
 
                     if (groups.isNotEmpty()) {
                         Column {
@@ -1954,23 +2971,22 @@ fun AuthScreen(onLoggedIn: () -> Unit) {
             .imePadding()
             .verticalScroll(rememberScrollState())
     ) {
-        Box(
-            Modifier
-                .fillMaxWidth()
-                .background(Yellow)
-                .border(3.dp, Ink)
-                .padding(20.dp)
-        ) {
-            Column {
-                Text(
-                    "BUNK WISE",
-                    fontSize = 32.sp,
-                    fontWeight = FontWeight.Black,
-                    fontFamily = FontFamily.Monospace,
-                    color = Ink
-                )
-                Text("Log in to back up your attendance.", fontWeight = FontWeight.Bold, color = Ink)
-            }
+        LoginHero()
+
+        Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 20.dp)) {
+            Text(
+                if (signUp) "Create your account" else "Welcome back",
+                fontSize = 24.sp,
+                fontWeight = FontWeight.Black,
+                color = Ink
+            )
+            Text(
+                if (signUp) "Sign up to back up your attendance on every device."
+                else "Log in to pick up where you left off.",
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                color = Ink
+            )
         }
 
         Row(
@@ -1981,7 +2997,7 @@ fun AuthScreen(onLoggedIn: () -> Unit) {
             TabButton("SIGN UP", Pink, signUp, Modifier.weight(1f)) { signUp = true; message = null }
         }
 
-        Box(Modifier.padding(16.dp)) {
+        Box(Modifier.padding(start = 16.dp, end = 16.dp, top = 12.dp)) {
             NeoCard {
                 FieldLabel("EMAIL")
                 NeoField(email, { email = it.trim() }, "you@college.edu", KeyboardType.Email)
@@ -2012,16 +3028,211 @@ fun AuthScreen(onLoggedIn: () -> Unit) {
 
                 if (!signUp) NeoButton("FORGOT PASSWORD?", White) { resetPassword() }
 
-                Spacer(Modifier.height(10.dp))
-                Text(
-                    "OR",
-                    modifier = Modifier.fillMaxWidth(),
-                    textAlign = TextAlign.Center,
-                    fontWeight = FontWeight.Black
-                )
-                Spacer(Modifier.height(10.dp))
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Box(Modifier.weight(1f).height(3.dp).background(Ink))
+                    Text("OR", fontWeight = FontWeight.Black, color = Ink)
+                    Box(Modifier.weight(1f).height(3.dp).background(Ink))
+                }
                 NeoButton("G   CONTINUE WITH GOOGLE", White) { if (!loading) googleSignIn() }
             }
+        }
+
+        FeatureStickers()
+    }
+}
+
+/**
+ * Login banner: yellow sunburst, Bunkr logo, "Bunk smart." headline, a gauge on a cream sun,
+ * a MARK > PREDICT > BUNK strip and a checkered finish line. Small stickers sit along the top edge.
+ */
+@Composable
+private fun LoginHero() {
+    val rayLight = Color(0xFFFFE066)
+    Column(Modifier.fillMaxWidth()) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .clipToBounds()
+                .drawBehind {
+                    drawRect(Yellow)
+                    val c = Offset(size.width * 0.85f, size.height * 0.52f)
+                    val r = Math.hypot(size.width.toDouble(), size.height.toDouble()).toFloat()
+                    for (k in 0 until 23) {
+                        drawArc(
+                            color = rayLight,
+                            startAngle = 8f + 16f * k - 90f,
+                            sweepAngle = 8f,
+                            useCenter = true,
+                            topLeft = Offset(c.x - r, c.y - r),
+                            size = Size(2f * r, 2f * r)
+                        )
+                    }
+                }
+        ) {
+            // cream sun behind the gauge
+            Box(
+                Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 8.dp, end = 7.dp)
+                    .size(104.dp)
+                    .drawBehind {
+                        drawCircle(Ink, size.minDimension / 2, center + Offset(4.dp.toPx(), 4.dp.toPx()))
+                    }
+                    .background(Cream, CircleShape)
+                    .border(3.dp, Ink, CircleShape)
+            )
+
+            // small stickers along the top edge
+            Text("\u2726", fontSize = 12.sp, color = Ink, modifier = Modifier.offset(x = 50.dp, y = 1.dp))
+            Box(
+                Modifier.offset(x = 100.dp, y = 2.dp).size(10.dp)
+                    .background(Pink, CircleShape).border(2.dp, Ink, CircleShape)
+            )
+            Box(Modifier.offset(x = 126.dp, y = 5.dp).size(5.dp).background(Ink, CircleShape))
+            Box(
+                Modifier.offset(x = 150.dp, y = 3.dp).size(9.dp).graphicsLayer { rotationZ = 22f }
+                    .background(Color(0xFF70E8BA)).border(2.dp, Ink)
+            )
+            Box(Modifier.offset(x = 176.dp, y = 4.dp).size(5.dp).background(Ink, CircleShape))
+            Text(
+                "+", fontSize = 14.sp, fontWeight = FontWeight.Black, color = Ink,
+                modifier = Modifier.offset(x = 190.dp, y = (-3).dp)
+            )
+            Box(
+                Modifier.offset(x = 210.dp, y = 5.dp).width(12.dp).height(3.dp)
+                    .graphicsLayer { rotationZ = -20f }.background(Ink)
+            )
+            Text("\u2605", fontSize = 12.sp, color = Ink, modifier = Modifier.offset(x = 228.dp, y = (-1).dp))
+
+            Column {
+                Row(
+                    Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    BunkrLogo(64.dp)
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "Bunk smart.",
+                            fontSize = 27.sp,
+                            lineHeight = 27.sp,
+                            fontWeight = FontWeight.Black,
+                            color = Ink,
+                            modifier = Modifier
+                                .drawBehind {
+                                    drawRect(Pink, Offset(0f, size.height * 0.6f), Size(size.width, size.height * 0.3f))
+                                }
+                                .padding(horizontal = 2.dp)
+                        )
+                        Spacer(Modifier.height(5.dp))
+                        Text(
+                            "Know how many classes you can skip.",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Ink
+                        )
+                    }
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        AttendanceGauge()
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            "GOAL 75%",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Black,
+                            fontFamily = FontFamily.Monospace,
+                            color = Ink
+                        )
+                    }
+                }
+                Row(
+                    Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    StepPill("1", "MARK", Lime, Modifier.weight(1f))
+                    Text("\u2192", fontWeight = FontWeight.Black, color = Ink)
+                    StepPill("2", "PREDICT", Sky, Modifier.weight(1f))
+                    Text("\u2192", fontWeight = FontWeight.Black, color = Ink)
+                    StepPill("3", "BUNK", Pink, Modifier.weight(1f))
+                }
+                CheckerStrip()
+            }
+
+            // check badge on the logo corner
+            Box(
+                Modifier
+                    .offset(x = 66.dp, y = 60.dp)
+                    .size(20.dp)
+                    .background(Lime, CircleShape)
+                    .border(2.5.dp, Ink, CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Text("\u2713", fontSize = 11.sp, fontWeight = FontWeight.Black, color = Ink)
+            }
+        }
+        Box(Modifier.fillMaxWidth().height(3.dp).background(Ink))
+    }
+}
+
+@Composable
+private fun StepPill(number: String, label: String, dot: Color, modifier: Modifier = Modifier) {
+    Row(
+        modifier
+            .drawBehind { drawRect(Ink, Offset(3.dp.toPx(), 3.dp.toPx()), size) }
+            .background(White)
+            .border(3.dp, Ink)
+            .padding(start = 4.dp, end = 6.dp, top = 3.dp, bottom = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center
+    ) {
+        Box(
+            Modifier.size(18.dp).background(dot, CircleShape).border(2.dp, Ink, CircleShape),
+            contentAlignment = Alignment.Center
+        ) { Text(number, fontSize = 10.sp, fontWeight = FontWeight.Black, color = Ink) }
+        Spacer(Modifier.width(4.dp))
+        Text(label, fontSize = 11.sp, fontWeight = FontWeight.Black, color = Ink, maxLines = 1)
+    }
+}
+
+@Composable
+private fun CheckerStrip() {
+    Column(Modifier.fillMaxWidth()) {
+        Box(Modifier.fillMaxWidth().height(3.dp).background(Ink))
+        Canvas(Modifier.fillMaxWidth().height(12.dp)) {
+            val sq = 6.dp.toPx()
+            val cols = (size.width / sq).toInt() + 1
+            for (r in 0..1) for (c in 0 until cols) {
+                drawRect(if ((r + c) % 2 == 0) Ink else White, Offset(c * sq, r * sq), Size(sq, sq))
+            }
+        }
+    }
+}
+
+@Composable
+private fun FeatureStickers() {
+    val items = listOf(Triple("BUNK CALC", Yellow, -3f), Triple("TIMETABLE", Sky, 2f), Triple("CLOUD SYNC", Pink, -2f))
+    Row(
+        Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 20.dp, bottom = 24.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally)
+    ) {
+        items.forEach { (label, color, rot) ->
+            Text(
+                label,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Black,
+                letterSpacing = 1.sp,
+                color = Ink,
+                modifier = Modifier
+                    .graphicsLayer { rotationZ = rot }
+                    .drawBehind { drawRect(Ink, Offset(3.dp.toPx(), 3.dp.toPx()), size) }
+                    .background(color)
+                    .border(3.dp, Ink)
+                    .padding(horizontal = 10.dp, vertical = 4.dp)
+            )
         }
     }
 }
@@ -2073,7 +3284,7 @@ fun VerifyEmailScreen(user: FirebaseUser, onVerified: () -> Unit, onLogout: () -
         ) {
             Column {
                 Text(
-                    "BUNK WISE",
+                    "BUNKR",
                     fontSize = 32.sp,
                     fontWeight = FontWeight.Black,
                     fontFamily = FontFamily.Monospace,
@@ -2117,7 +3328,7 @@ fun VerifyEmailScreen(user: FirebaseUser, onVerified: () -> Unit, onLogout: () -
 
 // ---------- Main screen ----------
 @Composable
-fun BunkWiseApp(user: FirebaseUser, onLogout: () -> Unit) {
+fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
     val context = LocalContext.current
     val store = remember(user.uid) { SubjectStore(context.applicationContext, user.uid) }
     var data by remember(user.uid) { mutableStateOf(store.loadLocal()) }
@@ -2136,6 +3347,12 @@ fun BunkWiseApp(user: FirebaseUser, onLogout: () -> Unit) {
     var editing by remember { mutableStateOf<Subject?>(null) }
     var semDialog by remember { mutableStateOf(0) } // 0 = none, 1 = new semester, 2 = edit semester
     var tab by rememberSaveable { mutableStateOf(0) } // 0 = THEORY, 1 = LAB
+
+    // A PRESENT / ABSENT press on a notification saves in the background; reload so the screen (and later saves) stay current.
+    DisposableEffect(user.uid) {
+        val stop = store.listenForChanges { data = store.loadLocal() }
+        onDispose { stop() }
+    }
 
     LaunchedEffect(user.uid) {
         syncStatus = "SYNCING..."
@@ -2182,6 +3399,7 @@ fun BunkWiseApp(user: FirebaseUser, onLogout: () -> Unit) {
     LaunchedEffect(current.id, current.slots) {
         Reminders.saveSlots(context, current.slots)
         Reminders.scheduleNext(context)
+        ClassEndAlerts.scheduleNext(context)
     }
 
     if (!ready) {
@@ -2199,41 +3417,41 @@ fun BunkWiseApp(user: FirebaseUser, onLogout: () -> Unit) {
     }
 
     Box(Modifier.fillMaxSize().background(Cream)) {
-        Column(Modifier.fillMaxSize().statusBarsPadding()) {
-            Box(
-                Modifier
-                    .fillMaxWidth()
-                    .background(Yellow)
-                    .border(3.dp, Ink)
-                    .padding(20.dp)
-            ) {
-                Column {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            "BUNK WISE",
-                            modifier = Modifier.weight(1f),
-                            fontSize = 32.sp,
-                            fontWeight = FontWeight.Black,
-                            fontFamily = FontFamily.Monospace,
-                            color = Ink
-                        )
-                        Box(
-                            Modifier
-                                .background(Red)
-                                .border(3.dp, Ink)
-                                .clickable { onLogout() }
-                                .padding(horizontal = 10.dp, vertical = 4.dp)
-                        ) { Text("LOGOUT", fontWeight = FontWeight.Black, fontSize = 12.sp, color = Ink) }
-                    }
-                    Text("Skip smart. Stay above the line.", fontWeight = FontWeight.Bold, color = Ink)
-                    Text(
-                        "${user.email ?: ""}  -  $syncStatus",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 12.sp,
-                        color = Ink
-                    )
-                }
+        Column(Modifier.fillMaxSize().statusBarsPadding().verticalScroll(rememberScrollState())) {
+            val tracked = subjects.flatMap { listOfNotNull(it.theory, it.lab) }.filter { it.total > 0 }
+            val sumA = tracked.sumOf { it.attended }
+            val sumT = tracked.sumOf { it.total }
+            val safeCount = tracked.count { it.isSafe }
+            val next = remember(current.slots) { nextClass(current.slots, System.currentTimeMillis()) }
+            val overallFraction = if (sumT == 0) 0f else sumA.toFloat() / sumT
+            val requiredFraction = if (tracked.isEmpty()) 0.75f else tracked.map { it.required }.average().toFloat() / 100f
+            val statusText = when {
+                tracked.isEmpty() -> "NO DATA"
+                safeCount == tracked.size -> "ALL SAFE"
+                safeCount * 2 >= tracked.size -> "WATCH OUT"
+                else -> "AT RISK"
             }
+            val statusColor = when (statusText) {
+                "ALL SAFE" -> Lime
+                "WATCH OUT" -> Yellow
+                "AT RISK" -> Red
+                else -> Sky
+            }
+
+            BunkrHeader(
+                email = user.email ?: "",
+                syncStatus = syncStatus,
+                overallFraction = overallFraction,
+                requiredFraction = requiredFraction,
+                overallText = if (sumT == 0) "--" else "${"%.0f".format(pct(sumA, sumT))}%",
+                safeText = "$safeCount/${tracked.size} SAFE",
+                nextText = next?.let { "NEXT ${it.first.subject} • ${formatTime(it.first.start)}" } ?: "NO CLASSES",
+                onLogout = onLogout,
+                statusText = statusText,
+                statusColor = statusColor,
+                semesterName = current.name,
+                next = next
+            )
 
             ScreenSwitch(selected = screen, onSelect = { screen = it })
 
@@ -2259,14 +3477,14 @@ fun BunkWiseApp(user: FirebaseUser, onLogout: () -> Unit) {
 
                 val visible = if (tab == 0) subjects.filter { it.theory != null } else subjects.filter { it.lab != null }
 
-                LazyColumn(
-                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 120.dp),
+                Column(
+                    Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 120.dp),
                     verticalArrangement = Arrangement.spacedBy(22.dp)
                 ) {
-                    item { OverallCard(subjects, tab) }
+                    OverallCard(subjects, tab)
 
                     if (visible.isEmpty()) {
-                        item {
+                        run {
                             NeoCard(color = if (tab == 0) Sky else Pink) {
                                 if (tab == 0) {
                                     Text("NO SUBJECTS IN ${current.name.uppercase()} YET", fontWeight = FontWeight.Black, fontSize = 18.sp)
@@ -2284,19 +3502,21 @@ fun BunkWiseApp(user: FirebaseUser, onLogout: () -> Unit) {
                         }
                     }
 
-                    items(visible, key = { it.id }) { s ->
-                        SubjectCard(
-                            s = s,
-                            tab = tab,
-                            onChange = { changed -> update(subjects.map { if (it.id == s.id) changed else it }) },
-                            onEdit = { editing = s },
-                            onDelete = {
-                                // Removes the subject from THIS tab only. If no section is left, it is deleted.
-                                val updated = if (tab == 0) s.copy(theory = null) else s.copy(lab = null)
-                                if (updated.theory == null && updated.lab == null) update(subjects.filter { it.id != s.id })
-                                else update(subjects.map { if (it.id == s.id) updated else it })
-                            }
-                        )
+                    visible.forEach { s ->
+                        key(s.id) {
+                            SubjectCard(
+                                s = s,
+                                tab = tab,
+                                onChange = { changed -> update(subjects.map { if (it.id == s.id) changed else it }) },
+                                onEdit = { editing = s },
+                                onDelete = {
+                                    // Removes the subject from THIS tab only. If no section is left, it is deleted.
+                                    val updated = if (tab == 0) s.copy(theory = null) else s.copy(lab = null)
+                                    if (updated.theory == null && updated.lab == null) update(subjects.filter { it.id != s.id })
+                                    else update(subjects.map { if (it.id == s.id) updated else it })
+                                }
+                            )
+                        }
                     }
                 }
             }

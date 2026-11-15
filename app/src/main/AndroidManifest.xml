@@ -24,6 +24,10 @@
 
         <receiver android:name=".ReminderReceiver" android:exported="false" />
 
+        <!-- After-class "mark attendance" notification -->
+        <receiver android:name=".ClassEndReceiver" android:exported="false" />
+        <receiver android:name=".AttendanceActionReceiver" android:exported="false" />
+
         <receiver
             android:name=".BootReceiver"
             android:exported="false">

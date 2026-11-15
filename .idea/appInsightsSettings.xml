@@ -22,8 +22,8 @@
             <InsightsFilterSettings>
               <option name="connection">
                 <ConnectionSetting>
-                  <option name="appId" value="Com.example.attendance" />
-                  <option name="mobileSdkAppId" value="1:816085499625:android:e776a2f577fdab7b4aba78" />
+                  <option name="appId" value="com.bunkr.attendance" />
+                  <option name="mobileSdkAppId" value="1:816085499625:android:8bf4d96d1b69eab84aba78" />
                   <option name="projectId" value="com-example-firstapp-e2783" />
                   <option name="projectNumber" value="816085499625" />
                 </ConnectionSetting>
