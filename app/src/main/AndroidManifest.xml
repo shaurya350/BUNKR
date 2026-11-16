@@ -27,6 +27,17 @@
         <!-- After-class "mark attendance" notification -->
         <receiver android:name=".ClassEndReceiver" android:exported="false" />
         <receiver android:name=".AttendanceActionReceiver" android:exported="false" />
+        <receiver android:name=".ExamReminderReceiver" android:exported="false" />
+
+        <!-- Home screen widget -->
+        <receiver android:name=".BunkrWidget" android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/bunkr_widget_info" />
+        </receiver>
 
         <receiver
             android:name=".BootReceiver"

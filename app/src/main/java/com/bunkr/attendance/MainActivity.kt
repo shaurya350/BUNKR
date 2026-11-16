@@ -265,16 +265,20 @@ data class Semester(
     val id: Long,
     val name: String,
     val subjects: List<Subject>,
-    val slots: List<ClassSlot> = emptyList()
+    val slots: List<ClassSlot> = emptyList(),
+    val daysOff: List<DayOff> = emptyList(), // holidays and leave
+    val exams: List<Exam> = emptyList(),      // exam datesheet
+    val marks: List<ExamMark> = emptyList()   // exam marks (MST 1, MST 2, Final, etc.)
 )
 
 data class AppData(val semesters: List<Semester>, val selectedId: Long)
 
 val AppData.hasContent: Boolean
-    get() = semesters.size > 1 || semesters.any { it.subjects.isNotEmpty() || it.slots.isNotEmpty() }
+    get() = semesters.size > 1 || semesters.any { it.subjects.isNotEmpty() || it.slots.isNotEmpty() || it.daysOff.isNotEmpty() || it.exams.isNotEmpty() || it.marks.isNotEmpty() }
 
 // ---------- Storage (local cache + Firebase cloud backup) ----------
 class SubjectStore(context: Context, uid: String) {
+    private val appContext = context.applicationContext
     private val prefs = context.getSharedPreferences("bunkwise", Context.MODE_PRIVATE)
     private val key = "subjects_$uid"
     private val doc = Firebase.firestore.collection("users").document(uid)
@@ -294,6 +298,7 @@ class SubjectStore(context: Context, uid: String) {
 
     fun saveLocal(data: AppData) {
         prefs.edit().putString(key, encode(data)).apply()
+        BunkrWidget.refreshAll(appContext) // keep the home screen widget in step
     }
 
     /** Calls [onChange] when the saved data changes (e.g. from a notification button). Returns a function that stops listening. */
@@ -327,6 +332,8 @@ class SubjectStore(context: Context, uid: String) {
     //   @sel|<selectedSemesterId>
     //   #sem|<id>|<name>
     //   ~slot|<id>|<day>|<start>|<end>|<subject>|<lab>|<room>|<teacher>   (timetable classes of that semester)
+    //   ~off|<id>|<kind>|<startDay>|<endDay>|<leavePresent>|<appliedUntil>|<name>   (holidays and leave of that semester)
+    //   ~exam|<id>|<type>|<day>|<start>|<end>|<subject>|<note>   (exams of that semester)
     //   <subject lines...>   id|name|tA|tT|tR|hasLab|lA|lT|lR|hasTheory   (older 5 and 9 field lines still load)
     // Data saved before semesters existed (just subject lines) loads into "Semester 1".
     private fun parseSubject(line: String): Subject? {
@@ -364,7 +371,10 @@ class SubjectStore(context: Context, uid: String) {
             val id: Long,
             val name: String,
             val subjects: MutableList<Subject> = mutableListOf(),
-            val slots: MutableList<ClassSlot> = mutableListOf()
+            val slots: MutableList<ClassSlot> = mutableListOf(),
+            val daysOff: MutableList<DayOff> = mutableListOf(),
+            val exams: MutableList<Exam> = mutableListOf(),
+            val marks: MutableList<ExamMark> = mutableListOf()
         )
 
         val builders = mutableListOf<Builder>()
@@ -374,6 +384,9 @@ class SubjectStore(context: Context, uid: String) {
                 line.isBlank() -> {}
                 line.startsWith("@sel|") -> selected = line.substringAfter("|").toLongOrNull() ?: 0L
                 line.startsWith("~slot|") -> decodeSlot(line)?.let { builders.lastOrNull()?.slots?.add(it) }
+                line.startsWith("~off|") -> decodeDayOff(line)?.let { builders.lastOrNull()?.daysOff?.add(it) }
+                line.startsWith("~exam|") -> decodeExam(line)?.let { builders.lastOrNull()?.exams?.add(it) }
+                line.startsWith("~mark|") -> decodeMark(line)?.let { builders.lastOrNull()?.marks?.add(it) }
                 line.startsWith("#sem|") -> {
                     val p = line.split("|")
                     if (p.size >= 3) builders.add(Builder(p[1].toLongOrNull() ?: (builders.size + 1L), p[2]))
@@ -385,7 +398,7 @@ class SubjectStore(context: Context, uid: String) {
             }
         }
         if (builders.isEmpty()) builders.add(Builder(1L, "Semester 1"))
-        val semesters = builders.map { Semester(it.id, it.name, it.subjects.toList(), it.slots.toList()) }
+        val semesters = builders.map { Semester(it.id, it.name, it.subjects.toList(), it.slots.toList(), it.daysOff.toList(), it.exams.toList(), it.marks.toList()) }
         return AppData(semesters, if (semesters.any { it.id == selected }) selected else semesters.first().id)
     }
 
@@ -395,6 +408,9 @@ class SubjectStore(context: Context, uid: String) {
             append("#sem|").append(sem.id).append('|').append(clean(sem.name)).append('\n')
             sem.subjects.forEach { append(encodeSubject(it)).append('\n') }
             sem.slots.forEach { append("~slot|").append(encodeSlot(it)).append('\n') }
+            sem.daysOff.forEach { append("~off|").append(encodeDayOff(it)).append('\n') }
+            sem.exams.forEach { append("~exam|").append(encodeExam(it)).append('\n') }
+            sem.marks.forEach { append("~mark|").append(encodeMark(it)).append('\n') }
         }
     }
 }
@@ -411,7 +427,10 @@ class MainActivity : ComponentActivity() {
             val logout = {
                 Reminders.clear(applicationContext)
                 ClassEndAlerts.clear(applicationContext)
+                ExamReminders.clear(applicationContext)
                 Firebase.auth.signOut()
+                TodayMarks.clear(applicationContext)
+                BunkrWidget.refreshAll(applicationContext)
                 user = null
                 verified = false
             }
@@ -1531,7 +1550,7 @@ private fun parseAttendanceLine(raw: String, defaultLab: Boolean): ParsedRow? {
 }
 
 /** Rebuilds table rows from OCR output by grouping text pieces that sit on the same height. */
-private fun rowsFromOcr(text: MlText): String {
+fun rowsFromOcr(text: MlText): String {
     val pieces = text.textBlocks.flatMap { it.lines }.mapNotNull { l -> l.boundingBox?.let { l to it } }
         .sortedBy { it.second.centerY() }
     val rows = mutableListOf<MutableList<Pair<MlText.Line, android.graphics.Rect>>>()
@@ -1797,6 +1816,14 @@ object Reminders {
     fun loadSlots(c: Context): List<ClassSlot> =
         (prefs(c).getString("slots", "") ?: "").lines().filter { it.isNotBlank() }.mapNotNull { decodeSlot(it) }
 
+    /** Holidays and leave, so alerts can skip those days even when the app is closed. */
+    fun saveDaysOff(c: Context, daysOff: List<DayOff>) {
+        prefs(c).edit().putString("daysoff", daysOff.joinToString("\n") { encodeDayOff(it) }).apply()
+    }
+
+    fun loadDaysOff(c: Context): List<DayOff> =
+        (prefs(c).getString("daysoff", "") ?: "").lines().filter { it.isNotBlank() }.mapNotNull { decodeDayOff(it) }
+
     fun createChannel(c: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(CHANNEL, "Next class reminders", NotificationManager.IMPORTANCE_HIGH)
@@ -1824,7 +1851,8 @@ object Reminders {
 
         val leadMs = lead(c) * 60_000L
         val now = System.currentTimeMillis()
-        val next = loadSlots(c).map { it to nextStartMillis(it, now + leadMs) }.minByOrNull { it.second } ?: return
+        val offs = loadDaysOff(c)
+        val next = loadSlots(c).map { it to nextStartOutsideDaysOff(it, now + leadMs, offs) }.minByOrNull { it.second } ?: return
         val trigger = next.second - leadMs
         val pi = alarmIntent(c, next.first.id, next.second)
         try {
@@ -1838,7 +1866,7 @@ object Reminders {
     /** Called on logout: stop alerts and forget the previous account's classes. */
     fun clear(c: Context) {
         (c.getSystemService(Context.ALARM_SERVICE) as AlarmManager).cancel(alarmIntent(c))
-        prefs(c).edit().remove("slots").apply()
+        prefs(c).edit().remove("slots").remove("daysoff").apply()
     }
 
     @SuppressLint("MissingPermission")
@@ -1848,24 +1876,18 @@ object Reminders {
         ) return
         createChannel(c)
 
-        val mins = ((startAt - System.currentTimeMillis()) / 60_000).toInt().coerceAtLeast(1)
-        val kind = if (slot.isLab) "Lab" else "Theory"
-        val room = if (slot.room.isNotBlank()) " - Room ${slot.room}" else ""
-        val who = if (slot.teacher.isNotBlank()) " - ${slot.teacher}" else ""
         val open = PendingIntent.getActivity(
             c, 0,
             Intent(c, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val notification = NotificationCompat.Builder(c, CHANNEL)
-            .setSmallIcon(android.R.drawable.ic_lock_idle_alarm) // swap for your own icon later
-            .setContentTitle("Next class: ${slot.subject} ($kind)")
-            .setContentText("Starts at ${formatTime(slot.start)} (in $mins min)$room$who")
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setCategory(NotificationCompat.CATEGORY_REMINDER)
-            .setContentIntent(open)
-            .setAutoCancel(true)
-            .build()
+        val notification = NotificationDesign.buildClassReminder(
+            c = c,
+            slot = slot,
+            startAt = startAt,
+            channel = CHANNEL,
+            openApp = open
+        ).build()
         NotificationManagerCompat.from(c).notify(2001, notification)
     }
 }
@@ -1875,6 +1897,8 @@ class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         Reminders.scheduleNext(context)
         ClassEndAlerts.scheduleNext(context)
+        BunkrWidget.refreshAll(context)
+        ExamReminders.scheduleNext(context)
     }
 }
 
@@ -2282,10 +2306,11 @@ fun ScreenSwitch(selected: Int, onSelect: (Int) -> Unit) {
         Modifier
             .fillMaxWidth()
             .padding(start = 16.dp, end = 16.dp, top = 16.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp)
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        TabButton("ATTENDANCE", Lime, selected == 0, Modifier.weight(1f)) { onSelect(0) }
-        TabButton("TIMETABLE", Yellow, selected == 1, Modifier.weight(1f)) { onSelect(1) }
+        TabButton("ATTENDANCE", Lime, selected == 0, Modifier.weight(1f), fontSize = 13.sp) { onSelect(0) }
+        TabButton("TIMETABLE", Yellow, selected == 1, Modifier.weight(1f), fontSize = 13.sp) { onSelect(1) }
+        TabButton("EXAMS", Pink, selected == 2, Modifier.weight(1f), fontSize = 13.sp) { onSelect(2) }
     }
 }
 
@@ -3340,13 +3365,21 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
     var syncStatus by remember(user.uid) { mutableStateOf("") }
     var showAdd by remember { mutableStateOf(false) }
     var showImport by remember { mutableStateOf(false) }
-    var screen by rememberSaveable { mutableStateOf(0) } // 0 = attendance, 1 = timetable
+    var screen by rememberSaveable { mutableStateOf(0) } // 0 = attendance, 1 = timetable, 2 = exams
     var showSlotDialog by remember { mutableStateOf(false) }
     var editingSlot by remember { mutableStateOf<ClassSlot?>(null) }
     var showSlotImport by remember { mutableStateOf(false) }
+    var showPlanner by remember { mutableStateOf(false) }
+    var showDaysOff by remember { mutableStateOf(false) }
+    var showExamDialog by remember { mutableStateOf(false) }
+    var editingExam by remember { mutableStateOf<Exam?>(null) }
+    var showExamImport by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Subject?>(null) }
+    var showMarksDialog by remember { mutableStateOf(false) }
+    var selectedSubjectForMarks by remember { mutableStateOf<String?>(null) }
     var semDialog by remember { mutableStateOf(0) } // 0 = none, 1 = new semester, 2 = edit semester
     var tab by rememberSaveable { mutableStateOf(0) } // 0 = THEORY, 1 = LAB
+    var examTab by rememberSaveable { mutableStateOf(0) } // 0 = SCHEDULE, 1 = MARKS
 
     // A PRESENT / ABSENT press on a notification saves in the background; reload so the screen (and later saves) stay current.
     DisposableEffect(user.uid) {
@@ -3395,11 +3428,34 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
         commit(data.copy(semesters = data.semesters.map { if (it.id == current.id) it.copy(slots = new) else it }))
     }
 
+    /** Saves the exams of the selected semester. */
+    fun updateExams(new: List<Exam>) {
+        commit(data.copy(semesters = data.semesters.map { if (it.id == current.id) it.copy(exams = new) else it }))
+    }
+
+    /** Saves the marks of the selected semester. */
+    fun updateMarks(new: List<ExamMark>) {
+        commit(data.copy(semesters = data.semesters.map { if (it.id == current.id) it.copy(marks = new) else it }))
+    }
+
     // Keep the reminder alarm in step with the selected semester's timetable.
-    LaunchedEffect(current.id, current.slots) {
+    LaunchedEffect(current.id, current.slots, current.daysOff, current.exams) {
         Reminders.saveSlots(context, current.slots)
+        Reminders.saveDaysOff(context, current.daysOff)
         Reminders.scheduleNext(context)
         ClassEndAlerts.scheduleNext(context)
+        ExamReminders.saveExams(context, current.exams)
+        ExamReminders.scheduleNext(context)
+    }
+
+    // Leave that counts as present is added to the attendance as each of its classes ends.
+    LaunchedEffect(ready, current.daysOff) {
+        while (ready) {
+            val base = store.loadLocal()
+            val updated = applyLeaves(base)
+            if (updated !== base) commit(updated)
+            kotlinx.coroutines.delay(60_000)
+        }
     }
 
     if (!ready) {
@@ -3472,6 +3528,33 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
                     },
                     onDelete = { slot -> updateSlots(current.slots.filter { it.id != slot.id }) }
                 )
+            } else if (screen == 2) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    TabButton("SCHEDULE", Pink, examTab == 0, Modifier.weight(1f), fontSize = 14.sp) { examTab = 0 }
+                    TabButton("MARKS", Mint, examTab == 1, Modifier.weight(1f), fontSize = 14.sp) { examTab = 1 }
+                }
+
+                if (examTab == 0) {
+                    ExamScreen(
+                        exams = current.exams,
+                        onEdit = {
+                            editingExam = it
+                            showExamDialog = true
+                        }
+                    )
+                } else {
+                    MarksScreen(
+                        marks = current.marks,
+                        subjects = subjects,
+                        onUpdateMarks = { updateMarks(it) },
+                        onOpenAddMarks = { showMarksDialog = true }
+                    )
+                }
             } else {
                 TabSwitch(selected = tab, onSelect = { tab = it })
 
@@ -3482,6 +3565,11 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
                     verticalArrangement = Arrangement.spacedBy(22.dp)
                 ) {
                     OverallCard(subjects, tab)
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        NeoButton("SKIP PLANNER", Sky, Modifier.weight(1f)) { showPlanner = true }
+                        NeoButton("HOLIDAYS & LEAVE", Yellow, Modifier.weight(1f)) { showDaysOff = true }
+                    }
 
                     if (visible.isEmpty()) {
                         run {
@@ -3529,14 +3617,30 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
                 .padding(20.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            if (screen == 0) {
-                NeoButton("IMPORT", Sky, Modifier.weight(1f)) { showImport = true }
-                NeoButton("+ ADD SUBJECT", Lime, Modifier.weight(1f)) { showAdd = true }
-            } else {
-                NeoButton("IMPORT", Sky, Modifier.weight(1f)) { showSlotImport = true }
-                NeoButton("+ ADD CLASS", Lime, Modifier.weight(1f)) {
-                    editingSlot = null
-                    showSlotDialog = true
+            when (screen) {
+                0 -> {
+                    NeoButton("IMPORT", Sky, Modifier.weight(1f)) { showImport = true }
+                    NeoButton("+ ADD SUBJECT", Lime, Modifier.weight(1f)) { showAdd = true }
+                }
+                1 -> {
+                    NeoButton("IMPORT", Sky, Modifier.weight(1f)) { showSlotImport = true }
+                    NeoButton("+ ADD CLASS", Lime, Modifier.weight(1f)) {
+                        editingSlot = null
+                        showSlotDialog = true
+                    }
+                }
+                2 -> {
+                    if (examTab == 0) {
+                        NeoButton("DATESHEET", Sky, Modifier.weight(1f)) { showExamImport = true }
+                        NeoButton("+ ADD EXAM", Lime, Modifier.weight(1f)) {
+                            editingExam = null
+                            showExamDialog = true
+                        }
+                    } else {
+                        NeoButton("+ ENTER MARKS", Lime, Modifier.fillMaxWidth()) {
+                            showMarksDialog = true
+                        }
+                    }
                 }
             }
         }
@@ -3551,6 +3655,67 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
             onSave = { name, theory, lab ->
                 update(subjects + Subject(System.currentTimeMillis(), name, theory, lab))
                 showAdd = false
+            }
+        )
+    }
+
+    if (showPlanner) {
+        SkipPlannerDialog(semester = current, onDismiss = { showPlanner = false })
+    }
+
+    if (showDaysOff) {
+        DaysOffDialog(
+            daysOff = current.daysOff,
+            onChange = { list ->
+                commit(data.copy(semesters = data.semesters.map { if (it.id == current.id) it.copy(daysOff = list) else it }))
+            },
+            onDismiss = { showDaysOff = false }
+        )
+    }
+
+    if (showExamDialog) {
+        ExamDialog(
+            initial = editingExam,
+            subjectNames = subjects.map { it.name },
+            onDismiss = {
+                showExamDialog = false
+                editingExam = null
+            },
+            onSave = { exam ->
+                val old = editingExam
+                updateExams(if (old != null) current.exams.map { if (it.id == old.id) exam else it } else current.exams + exam)
+                showExamDialog = false
+                editingExam = null
+            },
+            onDelete = editingExam?.let { old ->
+                {
+                    updateExams(current.exams.filter { it.id != old.id })
+                    showExamDialog = false
+                    editingExam = null
+                }
+            }
+        )
+    }
+
+    if (showExamImport) {
+        ExamImportDialog(
+            subjectNames = subjects.map { it.name },
+            onDismiss = { showExamImport = false },
+            onApply = { type, parsed ->
+                var list = current.exams
+                val base = System.currentTimeMillis()
+                parsed.forEachIndexed { i, p ->
+                    val key = subjectKey(p.subject)
+                    val at = list.indexOfFirst { it.type == type && subjectKey(it.subject) == key }
+                    // an exam of this type and subject already exists: update it instead of repeating it
+                    list = if (at >= 0) {
+                        list.mapIndexed { j, e -> if (j == at) e.copy(subject = p.subject, day = p.day, start = p.start, end = p.end) else e }
+                    } else {
+                        list + Exam(base + i, p.subject, type, p.day, p.start, p.end)
+                    }
+                }
+                updateExams(list)
+                showExamImport = false
             }
         )
     }
@@ -3681,6 +3846,33 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
             }
         )
     }
+
+    if (showMarksDialog) {
+        val known = (subjects.map { it.name } + current.marks.map { it.subject })
+            .filter { it.isNotBlank() }
+            .distinctBy { subjectKey(it) }
+        NewSubjectMarksDialog(
+            knownSubjects = known,
+            onDismiss = { showMarksDialog = false },
+            onSelectSubject = { sub ->
+                showMarksDialog = false
+                selectedSubjectForMarks = sub
+            }
+        )
+    }
+
+    selectedSubjectForMarks?.let { subName ->
+        SubjectMarksDialog(
+            subjectName = subName,
+            marks = current.marks,
+            onDismiss = { selectedSubjectForMarks = null },
+            onSave = { updated ->
+                val otherMarks = current.marks.filter { subjectKey(it.subject) != subjectKey(subName) }
+                updateMarks(otherMarks + updated)
+                selectedSubjectForMarks = null
+            }
+        )
+    }
 }
 
 @Composable
@@ -3698,7 +3890,14 @@ fun TabSwitch(selected: Int, onSelect: (Int) -> Unit) {
 
 /** Selected tab looks pressed-in and colored; the other is raised and white. */
 @Composable
-fun TabButton(text: String, color: Color, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
+fun TabButton(
+    text: String,
+    color: Color,
+    selected: Boolean,
+    modifier: Modifier,
+    fontSize: androidx.compose.ui.unit.TextUnit = 16.sp,
+    onClick: () -> Unit
+) {
     val shift by animateDpAsState(if (selected) 4.dp else 0.dp, label = "tabShift")
     Box(modifier.padding(end = 4.dp, bottom = 4.dp)) {
         Box(
@@ -3716,7 +3915,7 @@ fun TabButton(text: String, color: Color, selected: Boolean, modifier: Modifier,
                 .padding(vertical = 12.dp),
             contentAlignment = Alignment.Center
         ) {
-            Text(text, fontWeight = FontWeight.Black, fontSize = 16.sp, color = Ink)
+            Text(text, fontWeight = FontWeight.Black, fontSize = fontSize, color = Ink)
         }
     }
 }

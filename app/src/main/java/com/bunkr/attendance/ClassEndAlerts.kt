@@ -32,6 +32,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  *     and sets the following alarm.
  *  3. A button press goes to AttendanceActionReceiver, which updates the saved data (SubjectStore),
  *     backs it up to Firestore, and swaps the notification for a short confirmation with UNDO.
+ *  4. CANCELLED changes nothing (the class didn't happen, so it isn't counted).
+ *  5. No prompt is shown on holidays / leave days. Leave that counts as present is added instead.
+ *  6. The home screen widget (BunkrWidget) sends the same buttons to AttendanceActionReceiver.
  */
 object ClassEndAlerts {
     private const val PREFS = "bunkwise_class_end"
@@ -42,6 +45,8 @@ object ClassEndAlerts {
     const val ACTION_ABSENT = "A"
     const val ACTION_UNDO_PRESENT = "UP"
     const val ACTION_UNDO_ABSENT = "UA"
+    const val ACTION_CANCELLED = "C"
+    const val ACTION_UNDO_CANCELLED = "UC"
 
     private fun prefs(c: Context) = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
@@ -105,9 +110,32 @@ object ClassEndAlerts {
             val d = cal.get(Calendar.DAY_OF_WEEK)
             val day = if (d == Calendar.SUNDAY) 7 else d - 1
             val minute = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
-            Reminders.loadSlots(c).filter { it.day == day && it.end == minute }.forEach { showPrompt(c, it) }
+
+            val today = epochDayOf(endAt)
+            val offs = Reminders.loadDaysOff(c).filter { it.covers(today) }
+            when {
+                // Holiday (or leave that isn't counted): nothing to mark.
+                offs.any { it.kind == OFF_HOLIDAY || !it.leavePresent } -> {}
+                // Leave that counts as present: add it instead of asking.
+                offs.isNotEmpty() -> catchUpLeaves(c)
+                else -> Reminders.loadSlots(c)
+                    .filter { it.day == day && it.end == minute && TodayMarks.get(c, it.id, today) == null }
+                    .forEach { showPrompt(c, it) }
+            }
         }
         scheduleNext(c, maxOf(System.currentTimeMillis(), endAt))
+    }
+
+    /** Adds leave classes that have ended since the last time (see applyLeaves), and backs the result up. */
+    private fun catchUpLeaves(c: Context) {
+        val uid = Firebase.auth.currentUser?.uid ?: return
+        val store = SubjectStore(c, uid)
+        val base = store.loadLocal()
+        val updated = applyLeaves(base)
+        if (updated !== base) {
+            store.saveLocal(updated)
+            store.saveCloud(updated) { }
+        }
     }
 
     // ---------- Notifications ----------
@@ -122,11 +150,22 @@ object ClassEndAlerts {
 
     private fun canNotify(c: Context) =
         Build.VERSION.SDK_INT < 33 ||
-            ContextCompat.checkSelfPermission(c, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+                ContextCompat.checkSelfPermission(c, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 
-    private fun notifId(slot: ClassSlot) = slot.id.hashCode()
+    fun notifId(slot: ClassSlot) = slot.id.hashCode()
 
-    private fun kindOf(slot: ClassSlot) = if (slot.isLab) "Lab" else "Theory"
+    /** Removes the prompt / confirmation notification of this class (used when it was marked from the widget). */
+    fun dismiss(c: Context, slot: ClassSlot) {
+        NotificationManagerCompat.from(c).cancel(notifId(slot))
+    }
+
+    /** Finds a timetable class by id: the copy kept for alarms first, then the saved data. */
+    fun slotById(c: Context, id: Long): ClassSlot? {
+        Reminders.loadSlots(c).firstOrNull { it.id == id }?.let { return it }
+        val uid = Firebase.auth.currentUser?.uid ?: return null
+        val data = SubjectStore(c, uid).loadLocal()
+        return data.semesters.firstOrNull { it.id == data.selectedId }?.slots?.firstOrNull { it.id == id }
+    }
 
     private fun openApp(c: Context): PendingIntent = PendingIntent.getActivity(
         c, 0,
@@ -143,6 +182,7 @@ object ClassEndAlerts {
             .setData(Uri.parse("bunkr://mark/${slot.id}/$action"))
             .putExtra("slotId", slot.id)
             .putExtra("action", action)
+            .putExtra("day", epochDayOf(System.currentTimeMillis())) // the day this class happened
         return PendingIntent.getBroadcast(c, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
     }
 
@@ -151,17 +191,30 @@ object ClassEndAlerts {
     fun showPrompt(c: Context, slot: ClassSlot) {
         if (!canNotify(c)) return
         createChannel(c)
-        val notification = NotificationCompat.Builder(c, CHANNEL)
-            .setSmallIcon(android.R.drawable.ic_lock_idle_alarm) // swap for your own icon later
-            .setContentTitle("${slot.subject} (${kindOf(slot)}) is over")
-            .setContentText("Were you present?")
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setCategory(NotificationCompat.CATEGORY_REMINDER)
-            .setContentIntent(openApp(c))
-            .addAction(0, "PRESENT", actionIntent(c, slot, ACTION_PRESENT))
-            .addAction(0, "ABSENT", actionIntent(c, slot, ACTION_ABSENT))
-            .setAutoCancel(true)
-            .build()
+        val notification = NotificationDesign.buildClassPrompt(
+            c = c,
+            slot = slot,
+            channel = CHANNEL,
+            openApp = openApp(c),
+            presentIntent = actionIntent(c, slot, ACTION_PRESENT),
+            absentIntent = actionIntent(c, slot, ACTION_ABSENT),
+            cancelledIntent = actionIntent(c, slot, ACTION_CANCELLED)
+        ).build()
+        NotificationManagerCompat.from(c).notify(notifId(slot), notification)
+    }
+
+    /** "Class cancelled": nothing is added to attended or total. UNDO brings the question back. */
+    @SuppressLint("MissingPermission")
+    fun showCancelled(c: Context, slot: ClassSlot) {
+        if (!canNotify(c)) return
+        createChannel(c)
+        val notification = NotificationDesign.buildClassCancelled(
+            c = c,
+            slot = slot,
+            channel = CHANNEL,
+            openApp = openApp(c),
+            undoIntent = actionIntent(c, slot, ACTION_UNDO_CANCELLED)
+        ).build()
         NotificationManagerCompat.from(c).notify(notifId(slot), notification)
     }
 
@@ -171,20 +224,16 @@ object ClassEndAlerts {
         if (!canNotify(c)) return
         createChannel(c)
         val present = action == ACTION_PRESENT
-        val r = marked.record
-        val text = "${r.attended}/${r.total} (${Math.round(r.percent)}%). ${r.verdict().first}"
-        val notification = NotificationCompat.Builder(c, CHANNEL)
-            .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
-            .setContentTitle("${if (present) "Present" else "Absent"}: ${marked.subjectName} (${kindOf(slot)})")
-            .setContentText(text)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setOnlyAlertOnce(true) // no second sound / pop-up for this update
-            .setContentIntent(openApp(c))
-            .addAction(0, "UNDO", actionIntent(c, slot, if (present) ACTION_UNDO_PRESENT else ACTION_UNDO_ABSENT))
-            .setTimeoutAfter(30_000)
-            .setAutoCancel(true)
-            .build()
+        val undoAction = if (present) ACTION_UNDO_PRESENT else ACTION_UNDO_ABSENT
+        val notification = NotificationDesign.buildClassResult(
+            c = c,
+            slot = slot,
+            action = action,
+            marked = marked,
+            channel = CHANNEL,
+            openApp = openApp(c),
+            undoIntent = actionIntent(c, slot, undoAction)
+        ).build()
         NotificationManagerCompat.from(c).notify(notifId(slot), notification)
     }
 
@@ -194,7 +243,8 @@ object ClassEndAlerts {
         if (!canNotify(c)) return
         createChannel(c)
         val notification = NotificationCompat.Builder(c, CHANNEL)
-            .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setColor(0xFFFF4444.toInt())
             .setContentTitle("Couldn't mark ${slot.subject}")
             .setContentText(message)
             .setStyle(NotificationCompat.BigTextStyle().bigText(message))
@@ -241,17 +291,39 @@ object ClassEndAlerts {
 /** Fires when a class ends. Register in AndroidManifest.xml. */
 class ClassEndReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        ClassEndAlerts.onAlarm(context.applicationContext, intent.getLongExtra("endAt", 0L))
+        // Stay alive a few seconds so a leave backup to Firestore can be queued before the process is frozen.
+        val pending = goAsync()
+        try {
+            ClassEndAlerts.onAlarm(context.applicationContext, intent.getLongExtra("endAt", 0L))
+        } finally {
+            Handler(Looper.getMainLooper()).postDelayed({ pending.finish() }, 3_000)
+        }
     }
 }
 
-/** Handles the PRESENT / ABSENT / UNDO buttons. Register in AndroidManifest.xml. */
+/** Handles the PRESENT / ABSENT / CANCELLED / UNDO buttons of the notification and of the home screen widget. */
 class AttendanceActionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val app = context.applicationContext
         val slotId = intent.getLongExtra("slotId", -1L)
         val action = intent.getStringExtra("action") ?: return
-        val slot = Reminders.loadSlots(app).firstOrNull { it.id == slotId } ?: return
+        val fromWidget = intent.getStringExtra("from") == "widget"
+        val slot = ClassEndAlerts.slotById(app, slotId) ?: return
+        // The day the class took place (set when the button was made), so a late tap is filed under that day.
+        val day = intent.getLongExtra("day", epochDayOf(System.currentTimeMillis()))
+
+        // CANCELLED and its UNDO never change the saved attendance.
+        if (action == ClassEndAlerts.ACTION_CANCELLED || action == ClassEndAlerts.ACTION_UNDO_CANCELLED) {
+            val cancelled = action == ClassEndAlerts.ACTION_CANCELLED
+            TodayMarks.set(app, slot.id, day, if (cancelled) "C" else null)
+            BunkrWidget.refreshAll(app)
+            when {
+                fromWidget -> ClassEndAlerts.dismiss(app, slot)
+                cancelled -> ClassEndAlerts.showCancelled(app, slot)
+                else -> ClassEndAlerts.showPrompt(app, slot)
+            }
+            return
+        }
 
         val uid = Firebase.auth.currentUser?.uid
         if (uid == null) {
@@ -278,10 +350,21 @@ class AttendanceActionReceiver : BroadcastReceiver() {
                 return
             }
 
-            if (action == ClassEndAlerts.ACTION_UNDO_PRESENT || action == ClassEndAlerts.ACTION_UNDO_ABSENT) {
-                ClassEndAlerts.showPrompt(app, slot) // after an undo, ask again
-            } else {
-                ClassEndAlerts.showResult(app, slot, action, marked)
+            val undo = action == ClassEndAlerts.ACTION_UNDO_PRESENT || action == ClassEndAlerts.ACTION_UNDO_ABSENT
+            TodayMarks.set(
+                app, slot.id, day,
+                when (action) {
+                    ClassEndAlerts.ACTION_PRESENT -> "P"
+                    ClassEndAlerts.ACTION_ABSENT -> "A"
+                    else -> null
+                }
+            )
+            BunkrWidget.refreshAll(app)
+
+            when {
+                fromWidget -> ClassEndAlerts.dismiss(app, slot) // the widget already shows the result
+                undo -> ClassEndAlerts.showPrompt(app, slot)    // after an undo, ask again
+                else -> ClassEndAlerts.showResult(app, slot, action, marked)
             }
 
             // The local save above is what counts. Firestore queues this write on disk even when offline,
