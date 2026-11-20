@@ -102,10 +102,14 @@ class BunkrWidget : AppWidgetProvider() {
             val now = System.currentTimeMillis()
             val today = epochDayOf(now)
             var next = millisOf(today + 1, 1) // one minute past midnight
-            Reminders.loadSlots(c).filter { it.day == weekdayOf(today) }.forEach { s ->
-                for (minute in listOf(s.start, s.end)) {
-                    val t = millisOf(today, minute)
-                    if (t > now && t < next) next = t
+            val regular = Reminders.loadSlots(c)
+            val temp = Reminders.loadTempSchedule(c)
+            if (!isExamDay(ExamReminders.loadExams(c), today)) {
+                effectiveSlotsForDay(regular, temp, today).forEach { s ->
+                    for (minute in listOf(s.start, s.end)) {
+                        val t = millisOf(today, minute)
+                        if (t > now && t < next) next = t
+                    }
                 }
             }
             // Not exact on purpose: a widget a minute late is fine and this needs no special permission.
@@ -210,7 +214,13 @@ class BunkrWidget : AppWidgetProvider() {
                 return showMessage(views, "ON LEAVE: ${it.name.uppercase()}\n($note)")
             }
 
-            val todays = sem.slots.filter { it.day == weekdayOf(today) }.sortedBy { it.start }
+            val todaysExams = sem.exams.filter { it.day == today }
+            if (todaysExams.isNotEmpty()) {
+                val examNames = todaysExams.joinToString(", ") { "${it.subject} (${EXAM_LABELS[it.type]})" }
+                return showMessage(views, "EXAM TODAY:\n$examNames")
+            }
+
+            val todays = effectiveSlotsForDay(sem.slots, sem.tempSchedule, today).sortedBy { it.start }
             if (todays.isEmpty()) return showMessage(views, "NO CLASSES TODAY")
 
             class Item(val slot: ClassSlot, val status: String?, val ended: Boolean)

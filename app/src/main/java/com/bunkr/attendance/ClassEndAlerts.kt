@@ -57,20 +57,6 @@ object ClassEndAlerts {
 
     // ---------- Scheduling ----------
 
-    /** The next moment this class ENDS, strictly after [from] (epoch millis). Same logic as nextStartMillis. */
-    private fun nextEndMillis(slot: ClassSlot, from: Long): Long {
-        val cal = Calendar.getInstance()
-        cal.timeInMillis = from
-        cal.set(Calendar.HOUR_OF_DAY, slot.end / 60)
-        cal.set(Calendar.MINUTE, slot.end % 60)
-        cal.set(Calendar.SECOND, 0)
-        cal.set(Calendar.MILLISECOND, 0)
-        val calDay = if (slot.day == 7) Calendar.SUNDAY else slot.day + 1 // Calendar: Sunday = 1, Monday = 2 ...
-        cal.add(Calendar.DAY_OF_YEAR, (calDay - cal.get(Calendar.DAY_OF_WEEK) + 7) % 7)
-        if (cal.timeInMillis <= from) cal.add(Calendar.DAY_OF_YEAR, 7)
-        return cal.timeInMillis
-    }
-
     private fun alarmIntent(c: Context, endAt: Long = 0L): PendingIntent =
         PendingIntent.getBroadcast(
             c, ALARM_REQUEST,
@@ -84,17 +70,40 @@ object ClassEndAlerts {
         am.cancel(alarmIntent(c))
         if (!enabled(c)) return
 
-        val next = Reminders.loadSlots(c)
-            .filter { it.end > it.start }
-            .map { it to nextEndMillis(it, from) }
-            .minByOrNull { it.second } ?: return
+        val regular = Reminders.loadSlots(c)
+        val temp = Reminders.loadTempSchedule(c)
+        val offs = Reminders.loadDaysOff(c)
+        val exams = ExamReminders.loadExams(c)
 
-        val pi = alarmIntent(c, next.second)
+        val startDay = epochDayOf(from)
+        var earliestSlot: ClassSlot? = null
+        var earliestEnd = Long.MAX_VALUE
+
+        for (d in startDay..(startDay + 14)) {
+            if (isDayOff(offs, d)) continue
+            if (isExamDay(exams, d)) continue
+            val daySlots = effectiveSlotsForDay(regular, temp, d)
+            for (slot in daySlots) {
+                if (slot.end <= slot.start) continue
+                val endMs = millisOf(d, slot.end)
+                if (endMs > from && endMs < earliestEnd) {
+                    earliestEnd = endMs
+                    earliestSlot = slot
+                }
+            }
+            if (earliestEnd != Long.MAX_VALUE && earliestEnd <= millisOf(d, 23 * 60 + 59)) {
+                break
+            }
+        }
+
+        if (earliestSlot == null || earliestEnd == Long.MAX_VALUE) return
+
+        val pi = alarmIntent(c, earliestEnd)
         try {
-            if (Reminders.canScheduleExact(c)) am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, next.second, pi)
-            else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, next.second, pi)
+            if (Reminders.canScheduleExact(c)) am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, earliestEnd, pi)
+            else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, earliestEnd, pi)
         } catch (e: SecurityException) {
-            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, next.second, pi)
+            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, earliestEnd, pi)
         }
     }
 
@@ -113,14 +122,21 @@ object ClassEndAlerts {
 
             val today = epochDayOf(endAt)
             val offs = Reminders.loadDaysOff(c).filter { it.covers(today) }
+            val hasExam = isExamDay(ExamReminders.loadExams(c), today)
             when {
+                // Exam days: no classes scheduled, nothing to mark.
+                hasExam -> {}
                 // Holiday (or leave that isn't counted): nothing to mark.
                 offs.any { it.kind == OFF_HOLIDAY || !it.leavePresent } -> {}
                 // Leave that counts as present: add it instead of asking.
                 offs.isNotEmpty() -> catchUpLeaves(c)
-                else -> Reminders.loadSlots(c)
-                    .filter { it.day == day && it.end == minute && TodayMarks.get(c, it.id, today) == null }
-                    .forEach { showPrompt(c, it) }
+                else -> {
+                    val regular = Reminders.loadSlots(c)
+                    val temp = Reminders.loadTempSchedule(c)
+                    effectiveSlotsForDay(regular, temp, today)
+                        .filter { it.day == day && it.end == minute && TodayMarks.get(c, it.id, today) == null }
+                        .forEach { showPrompt(c, it) }
+                }
             }
         }
         scheduleNext(c, maxOf(System.currentTimeMillis(), endAt))
@@ -162,9 +178,12 @@ object ClassEndAlerts {
     /** Finds a timetable class by id: the copy kept for alarms first, then the saved data. */
     fun slotById(c: Context, id: Long): ClassSlot? {
         Reminders.loadSlots(c).firstOrNull { it.id == id }?.let { return it }
+        Reminders.loadTempSchedule(c)?.slots?.firstOrNull { it.id == id }?.let { return it }
         val uid = Firebase.auth.currentUser?.uid ?: return null
         val data = SubjectStore(c, uid).loadLocal()
-        return data.semesters.firstOrNull { it.id == data.selectedId }?.slots?.firstOrNull { it.id == id }
+        val sem = data.semesters.firstOrNull { it.id == data.selectedId } ?: return null
+        sem.slots.firstOrNull { it.id == id }?.let { return it }
+        return sem.tempSchedule?.slots?.firstOrNull { it.id == id }
     }
 
     private fun openApp(c: Context): PendingIntent = PendingIntent.getActivity(
@@ -262,7 +281,7 @@ object ClassEndAlerts {
      * Applies one button press to the saved data (selected semester) and saves it locally.
      * Returns null when the class can't be matched to a subject that has that section (theory / lab).
      */
-    fun applyAction(store: SubjectStore, slot: ClassSlot, action: String): Marked? {
+    fun applyAction(store: SubjectStore, slot: ClassSlot, action: String, day: Long = epochDayOf(System.currentTimeMillis())): Marked? {
         val data = store.loadLocal()
         val sem = data.semesters.firstOrNull { it.id == data.selectedId } ?: return null
 
@@ -278,10 +297,28 @@ object ClassEndAlerts {
             else -> rec.undoAbsent()
         }
         val newSub = if (slot.isLab) sub.copy(lab = newRec) else sub.copy(theory = newRec)
+
+        // Record attendance log for day-by-day history
+        val logStatus = when (action) {
+            ACTION_PRESENT -> "P"
+            ACTION_ABSENT -> "A"
+            ACTION_CANCELLED -> "C"
+            else -> null
+        }
+        val updatedLogs = if (logStatus == null) {
+            sem.attendanceLogs.filter { !(it.day == day && it.subjectId == sub.id && it.isLab == slot.isLab && it.slotId == slot.id) }
+        } else {
+            val exist = sem.attendanceLogs.firstOrNull { it.day == day && it.subjectId == sub.id && it.isLab == slot.isLab && it.slotId == slot.id }
+            if (exist != null) sem.attendanceLogs.map { if (it.id == exist.id) it.copy(status = logStatus) else it }
+            else sem.attendanceLogs + AttendanceLog(id = System.currentTimeMillis(), day = day, subjectId = sub.id, isLab = slot.isLab, status = logStatus, slotId = slot.id)
+        }
+
+        val updatedSem = sem.copy(
+            subjects = sem.subjects.map { if (it.id == sub.id) newSub else it },
+            attendanceLogs = updatedLogs
+        )
         val newData = data.copy(
-            semesters = data.semesters.map { s ->
-                if (s.id == sem.id) s.copy(subjects = s.subjects.map { if (it.id == sub.id) newSub else it }) else s
-            }
+            semesters = data.semesters.map { s -> if (s.id == sem.id) updatedSem else s }
         )
         store.saveLocal(newData)
         return Marked(newData, sub.name, newRec)
@@ -340,7 +377,7 @@ class AttendanceActionReceiver : BroadcastReceiver() {
 
         try {
             val store = SubjectStore(app, uid)
-            val marked = ClassEndAlerts.applyAction(store, slot, action)
+            val marked = ClassEndAlerts.applyAction(store, slot, action, day)
             if (marked == null) {
                 ClassEndAlerts.showProblem(
                     app, slot,

@@ -94,6 +94,7 @@ data class DayOff(
 fun DayOff.covers(day: Long) = day in startDay..endDay
 
 fun isDayOff(offs: List<DayOff>, day: Long) = offs.any { it.covers(day) }
+fun isExamDay(exams: List<Exam>, day: Long) = exams.any { it.day == day }
 
 fun encodeDayOff(d: DayOff) =
     "${d.id}|${d.kind}|${d.startDay}|${d.endDay}|${if (d.leavePresent) 1 else 0}|${d.appliedUntil}|${cleanText(d.name)}"
@@ -180,7 +181,7 @@ fun applyLeaves(data: AppData, now: Long = System.currentTimeMillis()): AppData 
                     val rec = (if (lab) s.lab else s.theory) ?: continue
                     val n = countEnded(
                         sectionSlots(sem, sub, lab), off.startDay, off.endDay, off.appliedUntil, limit
-                    ) { d -> isDayOff(others, d) }
+                    ) { d -> isDayOff(others, d) || isExamDay(sem.exams, d) }
                     if (n > 0) {
                         val newRec = rec.copy(attended = rec.attended + n, total = rec.total + n)
                         s = if (lab) s.copy(lab = newRec) else s.copy(theory = newRec)

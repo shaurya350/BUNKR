@@ -93,4 +93,8 @@ dependencies {
     implementation(libs.androidx.credentials.play.services.auth)
     implementation(libs.googleid)
     implementation(libs.text.recognition)
+    // QR Code generation
+    implementation("com.google.zxing:core:3.5.4")
+    // Google Code Scanner (Play Services QR scanning without manual camera permission)
+    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
 }

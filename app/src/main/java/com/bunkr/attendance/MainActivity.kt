@@ -4,6 +4,7 @@ import android.content.Context
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.AlarmManager
+import android.app.DatePickerDialog
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -202,9 +203,43 @@ fun encodeSlot(s: ClassSlot) =
     "${s.id}|${s.day}|${s.start}|${s.end}|${cleanText(s.subject)}|${if (s.isLab) 1 else 0}|${cleanText(s.room)}|${cleanText(s.teacher)}"
 
 fun decodeSlot(text: String): ClassSlot? = runCatching {
-    val p = text.removePrefix("~slot|").split("|")
+    val p = text.removePrefix("~slot|").removePrefix("~tslot|").split("|")
     ClassSlot(p[0].toLong(), p[1].toInt(), p[2].toInt(), p[3].toInt(), p[4], p[5] == "1", p.getOrElse(6) { "" }, p.getOrElse(7) { "" })
 }.getOrNull()
+
+// ---------- Temporary Schedule ----------
+data class TemporarySchedule(
+    val id: Long = System.currentTimeMillis(),
+    val startDay: Long, // epoch day inclusive
+    val endDay: Long,   // epoch day inclusive
+    val slots: List<ClassSlot> = emptyList(),
+    val active: Boolean = true
+)
+
+fun TemporarySchedule.covers(day: Long): Boolean = active && day in startDay..endDay
+fun TemporarySchedule.isExpired(today: Long): Boolean = today > endDay
+
+fun encodeTempSchedule(t: TemporarySchedule) =
+    "${t.id}|${t.startDay}|${t.endDay}|${if (t.active) 1 else 0}"
+
+fun decodeTempSchedule(text: String): TemporarySchedule? = runCatching {
+    val p = text.removePrefix("~temp|").split("|")
+    TemporarySchedule(
+        id = p[0].toLong(),
+        startDay = p[1].toLong(),
+        endDay = p[2].toLong(),
+        active = p.getOrElse(3) { "1" } == "1"
+    )
+}.getOrNull()
+
+fun effectiveSlotsForDay(regular: List<ClassSlot>, temp: TemporarySchedule?, epochDay: Long): List<ClassSlot> {
+    if (temp != null && temp.active && epochDay in temp.startDay..temp.endDay) {
+        val wd = weekdayOf(epochDay)
+        return temp.slots.filter { it.day == wd }
+    }
+    val wd = weekdayOf(epochDay)
+    return regular.filter { it.day == wd }
+}
 
 fun formatTime(minutes: Int): String {
     val h = minutes / 60
@@ -228,7 +263,28 @@ fun nextStartMillis(slot: ClassSlot, from: Long): Long {
 }
 
 fun nextClass(slots: List<ClassSlot>, now: Long): Pair<ClassSlot, Long>? =
-    slots.map { it to nextStartMillis(it, now) }.minByOrNull { it.second }
+    nextClass(slots, null, now)
+
+fun nextClass(
+    slots: List<ClassSlot>,
+    tempSchedule: TemporarySchedule? = null,
+    now: Long = System.currentTimeMillis(),
+    daysOff: List<DayOff> = emptyList(),
+    exams: List<Exam> = emptyList()
+): Pair<ClassSlot, Long>? {
+    val startDay = epochDayOf(now)
+    for (d in startDay..(startDay + 14)) {
+        if (isDayOff(daysOff, d)) continue
+        if (isExamDay(exams, d)) continue
+        val daySlots = effectiveSlotsForDay(slots, tempSchedule, d)
+        val candidate = daySlots
+            .map { it to millisOf(d, it.start) }
+            .filter { it.second > now }
+            .minByOrNull { it.second }
+        if (candidate != null) return candidate
+    }
+    return null
+}
 
 fun todayIndex(): Int {
     val d = Calendar.getInstance().get(Calendar.DAY_OF_WEEK)
@@ -268,7 +324,9 @@ data class Semester(
     val slots: List<ClassSlot> = emptyList(),
     val daysOff: List<DayOff> = emptyList(), // holidays and leave
     val exams: List<Exam> = emptyList(),      // exam datesheet
-    val marks: List<ExamMark> = emptyList()   // exam marks (MST 1, MST 2, Final, etc.)
+    val marks: List<ExamMark> = emptyList(),  // exam marks (MST 1, MST 2, Final, etc.)
+    val tempSchedule: TemporarySchedule? = null, // temporary 1-2 day schedule
+    val attendanceLogs: List<AttendanceLog> = emptyList() // day-by-day attendance history
 )
 
 data class AppData(val semesters: List<Semester>, val selectedId: Long)
@@ -374,7 +432,10 @@ class SubjectStore(context: Context, uid: String) {
             val slots: MutableList<ClassSlot> = mutableListOf(),
             val daysOff: MutableList<DayOff> = mutableListOf(),
             val exams: MutableList<Exam> = mutableListOf(),
-            val marks: MutableList<ExamMark> = mutableListOf()
+            val marks: MutableList<ExamMark> = mutableListOf(),
+            var tempSchedule: TemporarySchedule? = null,
+            val tempSlots: MutableList<ClassSlot> = mutableListOf(),
+            val attendanceLogs: MutableList<AttendanceLog> = mutableListOf()
         )
 
         val builders = mutableListOf<Builder>()
@@ -387,6 +448,9 @@ class SubjectStore(context: Context, uid: String) {
                 line.startsWith("~off|") -> decodeDayOff(line)?.let { builders.lastOrNull()?.daysOff?.add(it) }
                 line.startsWith("~exam|") -> decodeExam(line)?.let { builders.lastOrNull()?.exams?.add(it) }
                 line.startsWith("~mark|") -> decodeMark(line)?.let { builders.lastOrNull()?.marks?.add(it) }
+                line.startsWith("~temp|") -> decodeTempSchedule(line)?.let { builders.lastOrNull()?.tempSchedule = it }
+                line.startsWith("~tslot|") -> decodeSlot(line)?.let { builders.lastOrNull()?.tempSlots?.add(it) }
+                line.startsWith("~log|") -> decodeAttendanceLog(line)?.let { builders.lastOrNull()?.attendanceLogs?.add(it) }
                 line.startsWith("#sem|") -> {
                     val p = line.split("|")
                     if (p.size >= 3) builders.add(Builder(p[1].toLongOrNull() ?: (builders.size + 1L), p[2]))
@@ -398,7 +462,14 @@ class SubjectStore(context: Context, uid: String) {
             }
         }
         if (builders.isEmpty()) builders.add(Builder(1L, "Semester 1"))
-        val semesters = builders.map { Semester(it.id, it.name, it.subjects.toList(), it.slots.toList(), it.daysOff.toList(), it.exams.toList(), it.marks.toList()) }
+        val semesters = builders.map {
+            Semester(
+                it.id, it.name, it.subjects.toList(), it.slots.toList(), it.daysOff.toList(),
+                it.exams.toList(), it.marks.toList(),
+                it.tempSchedule?.copy(slots = it.tempSlots.toList()),
+                it.attendanceLogs.toList()
+            )
+        }
         return AppData(semesters, if (semesters.any { it.id == selected }) selected else semesters.first().id)
     }
 
@@ -411,6 +482,11 @@ class SubjectStore(context: Context, uid: String) {
             sem.daysOff.forEach { append("~off|").append(encodeDayOff(it)).append('\n') }
             sem.exams.forEach { append("~exam|").append(encodeExam(it)).append('\n') }
             sem.marks.forEach { append("~mark|").append(encodeMark(it)).append('\n') }
+            sem.attendanceLogs.forEach { append("~log|").append(encodeAttendanceLog(it)).append('\n') }
+            sem.tempSchedule?.let { temp ->
+                append("~temp|").append(encodeTempSchedule(temp)).append('\n')
+                temp.slots.forEach { append("~tslot|").append(encodeSlot(it)).append('\n') }
+            }
         }
     }
 }
@@ -480,6 +556,29 @@ fun NeoButton(
     modifier: Modifier = Modifier,
     onClick: () -> Unit
 ) {
+    NeoButton(
+        text = text,
+        color = color,
+        modifier = modifier,
+        fontSize = 14.sp,
+        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+        maxLines = Int.MAX_VALUE,
+        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+        onClick = onClick
+    )
+}
+
+@Composable
+fun NeoButton(
+    text: String,
+    color: Color,
+    modifier: Modifier = Modifier,
+    fontSize: androidx.compose.ui.unit.TextUnit,
+    contentPadding: PaddingValues = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+    maxLines: Int = Int.MAX_VALUE,
+    textAlign: androidx.compose.ui.text.style.TextAlign = androidx.compose.ui.text.style.TextAlign.Center,
+    onClick: () -> Unit
+) {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val shift by animateDpAsState(if (pressed) 4.dp else 0.dp, label = "shift")
@@ -493,10 +592,19 @@ fun NeoButton(
                 .background(color)
                 .border(3.dp, Ink)
                 .clickable(interactionSource = interaction, indication = null, onClick = onClick)
-                .padding(horizontal = 14.dp, vertical = 10.dp),
+                .padding(contentPadding),
             contentAlignment = Alignment.Center
         ) {
-            Text(text, color = Ink, fontWeight = FontWeight.Black, fontSize = 14.sp)
+            Text(
+                text = text,
+                color = Ink,
+                fontWeight = FontWeight.Black,
+                fontSize = fontSize,
+                maxLines = maxLines,
+                softWrap = maxLines != 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                textAlign = textAlign
+            )
         }
     }
 }
@@ -1816,6 +1924,29 @@ object Reminders {
     fun loadSlots(c: Context): List<ClassSlot> =
         (prefs(c).getString("slots", "") ?: "").lines().filter { it.isNotBlank() }.mapNotNull { decodeSlot(it) }
 
+    fun saveTempSchedule(c: Context, temp: TemporarySchedule?) {
+        if (temp == null) {
+            prefs(c).edit().remove("temp_info").remove("temp_slots").apply()
+        } else {
+            prefs(c).edit()
+                .putString("temp_info", "${temp.id}|${temp.startDay}|${temp.endDay}|${if (temp.active) 1 else 0}")
+                .putString("temp_slots", temp.slots.joinToString("\n") { encodeSlot(it) })
+                .apply()
+        }
+    }
+
+    fun loadTempSchedule(c: Context): TemporarySchedule? {
+        val info = prefs(c).getString("temp_info", null) ?: return null
+        val p = info.split("|")
+        if (p.size < 4) return null
+        val id = p[0].toLongOrNull() ?: return null
+        val startDay = p[1].toLongOrNull() ?: return null
+        val endDay = p[2].toLongOrNull() ?: return null
+        val active = p[3] == "1"
+        val slots = (prefs(c).getString("temp_slots", "") ?: "").lines().filter { it.isNotBlank() }.mapNotNull { decodeSlot(it) }
+        return TemporarySchedule(id, startDay, endDay, slots, active)
+    }
+
     /** Holidays and leave, so alerts can skip those days even when the app is closed. */
     fun saveDaysOff(c: Context, daysOff: List<DayOff>) {
         prefs(c).edit().putString("daysoff", daysOff.joinToString("\n") { encodeDayOff(it) }).apply()
@@ -1852,21 +1983,48 @@ object Reminders {
         val leadMs = lead(c) * 60_000L
         val now = System.currentTimeMillis()
         val offs = loadDaysOff(c)
-        val next = loadSlots(c).map { it to nextStartOutsideDaysOff(it, now + leadMs, offs) }.minByOrNull { it.second } ?: return
-        val trigger = next.second - leadMs
-        val pi = alarmIntent(c, next.first.id, next.second)
+        val regular = loadSlots(c)
+        val temp = loadTempSchedule(c)
+        val exams = ExamReminders.loadExams(c)
+
+        val startDay = epochDayOf(now)
+        var earliestSlot: ClassSlot? = null
+        var earliestTrigger = Long.MAX_VALUE
+        var earliestStart = Long.MAX_VALUE
+
+        for (d in startDay..(startDay + 14)) {
+            if (isDayOff(offs, d)) continue
+            if (isExamDay(exams, d)) continue
+            val daySlots = effectiveSlotsForDay(regular, temp, d)
+            for (slot in daySlots) {
+                val startMs = millisOf(d, slot.start)
+                val trigger = startMs - leadMs
+                if (trigger > now && trigger < earliestTrigger) {
+                    earliestTrigger = trigger
+                    earliestStart = startMs
+                    earliestSlot = slot
+                }
+            }
+            if (earliestTrigger != Long.MAX_VALUE && earliestTrigger <= millisOf(d, 23 * 60 + 59)) {
+                break
+            }
+        }
+
+        if (earliestSlot == null || earliestTrigger == Long.MAX_VALUE) return
+
+        val pi = alarmIntent(c, earliestSlot.id, earliestStart)
         try {
-            if (canScheduleExact(c)) am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, trigger, pi)
-            else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, trigger, pi)
+            if (canScheduleExact(c)) am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, earliestTrigger, pi)
+            else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, earliestTrigger, pi)
         } catch (e: SecurityException) {
-            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, trigger, pi)
+            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, earliestTrigger, pi)
         }
     }
 
     /** Called on logout: stop alerts and forget the previous account's classes. */
     fun clear(c: Context) {
         (c.getSystemService(Context.ALARM_SERVICE) as AlarmManager).cancel(alarmIntent(c))
-        prefs(c).edit().remove("slots").remove("daysoff").apply()
+        prefs(c).edit().remove("slots").remove("daysoff").remove("temp_info").remove("temp_slots").apply()
     }
 
     @SuppressLint("MissingPermission")
@@ -1957,9 +2115,9 @@ private fun toRange(h1s: String, m1s: String, a1: String, h2s: String, m2s: Stri
  *   10:00 - 11:00 Physics Lab
  * or one class per line:  "Tue 9:00-10:00 Maths".
  */
-fun parseTimetableText(text: String): List<ParsedSlot> {
+fun parseTimetableText(text: String, defaultDay: Int? = null): List<ParsedSlot> {
     val out = mutableListOf<ParsedSlot>()
-    var day: Int? = null
+    var day: Int? = defaultDay
     var pending: Pair<Int, Int>? = null
 
     fun add(range: Pair<Int, Int>, name: String) {
@@ -2348,14 +2506,29 @@ fun SlotCard(slot: ClassSlot, onEdit: () -> Unit, onDelete: () -> Unit) {
 }
 
 @Composable
-fun TimetableScreen(slots: List<ClassSlot>, onEdit: (ClassSlot) -> Unit, onDelete: (ClassSlot) -> Unit) {
+fun TimetableScreen(
+    slots: List<ClassSlot>,
+    tempSchedule: TemporarySchedule?,
+    subjectNames: List<String>,
+    exams: List<Exam> = emptyList(),
+    daysOff: List<DayOff> = emptyList(),
+    onEdit: (ClassSlot) -> Unit,
+    onDelete: (ClassSlot) -> Unit,
+    onClearAll: () -> Unit,
+    onUpdateTempSchedule: (TemporarySchedule?) -> Unit
+) {
     val context = LocalContext.current
-    val next = remember(slots) { nextClass(slots, System.currentTimeMillis()) }
+    val today = remember { epochDayOf(System.currentTimeMillis()) }
+    val next = remember(slots, tempSchedule, daysOff, exams) {
+        nextClass(slots, tempSchedule, System.currentTimeMillis(), daysOff, exams)
+    }
     var day by rememberSaveable { mutableStateOf(todayIndex()) }
     var enabled by remember { mutableStateOf(Reminders.enabled(context)) }
     var lead by remember { mutableStateOf(Reminders.lead(context)) }
     var askAfter by remember { mutableStateOf(ClassEndAlerts.enabled(context)) }
     var blocked by remember { mutableStateOf(false) }
+    var showTempDialog by remember { mutableStateOf(false) }
+    var showClearDialog by remember { mutableStateOf(false) }
 
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         blocked = !granted
@@ -2369,7 +2542,17 @@ fun TimetableScreen(slots: List<ClassSlot>, onEdit: (ClassSlot) -> Unit, onDelet
         Reminders.scheduleNext(context)
     }
 
-    val daySlots = slots.filter { it.day == day }.sortedBy { it.start }
+    val isTempActiveToday = tempSchedule != null && tempSchedule.covers(today)
+    val isTempUpcoming = tempSchedule != null && tempSchedule.active && tempSchedule.startDay > today
+
+    var viewRegularForToday by remember { mutableStateOf(false) }
+    val showingTemp = day == todayIndex() && isTempActiveToday && !viewRegularForToday
+
+    val daySlots = if (showingTemp) {
+        tempSchedule!!.slots.filter { it.day == day }.sortedBy { it.start }
+    } else {
+        slots.filter { it.day == day }.sortedBy { it.start }
+    }
 
     Column(
         Modifier.padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 120.dp),
@@ -2393,6 +2576,76 @@ fun TimetableScreen(slots: List<ClassSlot>, onEdit: (ClassSlot) -> Unit, onDelet
                     val room = if (slot.room.isNotBlank()) "Room ${slot.room}" else ""
                     val info = listOf(until, room, slot.teacher).filter { it.isNotEmpty() }.joinToString("  -  ")
                     if (info.isNotEmpty()) Text(info, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                }
+            }
+        }
+
+        // Temporary Schedule Banner / Card
+        run {
+            when {
+                isTempActiveToday -> {
+                    NeoCard(color = Mint) {
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("⚡ TEMPORARY SCHEDULE ACTIVE", fontWeight = FontWeight.Black, fontSize = 14.sp)
+                            Tag("ACTIVE", Lime)
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "${dateText(tempSchedule!!.startDay)} - ${dateText(tempSchedule.endDay)}",
+                            fontWeight = FontWeight.Black, fontSize = 16.sp
+                        )
+                        Text(
+                            "Auto-reverts to regular timetable on ${dateText(tempSchedule.endDay + 1)}.",
+                            fontWeight = FontWeight.Bold, fontSize = 12.sp
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            NeoButton("VIEW / EDIT", White, Modifier.weight(1f)) { showTempDialog = true }
+                            NeoButton("REVERT TO REGULAR", Red, Modifier.weight(1f)) { onUpdateTempSchedule(null) }
+                        }
+                    }
+                }
+                isTempUpcoming -> {
+                    NeoCard(color = Sky) {
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("⏱ TEMPORARY SCHEDULE SCHEDULED", fontWeight = FontWeight.Black, fontSize = 14.sp)
+                            Tag("UPCOMING", Yellow)
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "${dateText(tempSchedule!!.startDay)} - ${dateText(tempSchedule.endDay)}",
+                            fontWeight = FontWeight.Black, fontSize = 16.sp
+                        )
+                        Text(
+                            "Will activate automatically on ${dateText(tempSchedule.startDay)}.",
+                            fontWeight = FontWeight.Bold, fontSize = 12.sp
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            NeoButton("VIEW / EDIT", White, Modifier.weight(1f)) { showTempDialog = true }
+                            NeoButton("CANCEL", Red, Modifier.weight(1f)) { onUpdateTempSchedule(null) }
+                        }
+                    }
+                }
+                else -> {
+                    NeoCard(color = Lavender) {
+                        Text("TEMPORARY SCHEDULE", fontWeight = FontWeight.Black, fontSize = 14.sp)
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Special 1-2 day routine? Set it here. It auto-reverts when done.",
+                            fontWeight = FontWeight.Bold, fontSize = 13.sp
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        NeoButton("SET UP TEMPORARY SCHEDULE", White) { showTempDialog = true }
+                    }
                 }
             }
         }
@@ -2485,18 +2738,416 @@ fun TimetableScreen(slots: List<ClassSlot>, onEdit: (ClassSlot) -> Unit, onDelet
             }
         }
 
+        if (day == todayIndex() && isTempActiveToday) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Tag(if (showingTemp) "TEMPORARY SCHEDULE (TODAY)" else "REGULAR TIMETABLE (TODAY)", if (showingTemp) Mint else Sky)
+                Text(
+                    if (showingTemp) "SHOW REGULAR" else "SHOW TEMPORARY",
+                    fontWeight = FontWeight.Black,
+                    fontSize = 12.sp,
+                    color = Ink,
+                    modifier = Modifier
+                        .background(White)
+                        .border(2.dp, Ink)
+                        .clickable { viewRegularForToday = !viewRegularForToday }
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                )
+            }
+        }
+
+        if (day == todayIndex() && isExamDay(exams, today)) {
+            val examNames = exams.filter { it.day == today }.joinToString(", ") { "${it.subject} (${EXAM_LABELS[it.type]})" }
+            NeoCard(color = Pink) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("📝 EXAM DAY TODAY", fontWeight = FontWeight.Black, fontSize = 14.sp)
+                    Tag("NO CLASSES", Red)
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(examNames, fontWeight = FontWeight.Black, fontSize = 16.sp)
+                Text(
+                    "Class reminders and alerts are paused for today.",
+                    fontWeight = FontWeight.Bold, fontSize = 12.sp
+                )
+            }
+        }
+
         if (daySlots.isEmpty()) {
             run {
                 NeoCard(color = Sky) {
-                    Text("NO CLASSES ON ${DAY_FULL[day - 1].uppercase()}", fontWeight = FontWeight.Black, fontSize = 16.sp)
+                    Text(
+                        if (showingTemp) "NO TEMPORARY CLASSES ON ${DAY_FULL[day - 1].uppercase()}"
+                        else "NO CLASSES ON ${DAY_FULL[day - 1].uppercase()}",
+                        fontWeight = FontWeight.Black, fontSize = 16.sp
+                    )
                 }
             }
         }
         daySlots.forEach { slot ->
             key(slot.id) {
-                SlotCard(slot, onEdit = { onEdit(slot) }, onDelete = { onDelete(slot) })
+                SlotCard(
+                    slot = slot,
+                    onEdit = {
+                        if (showingTemp && tempSchedule != null) {
+                            showTempDialog = true
+                        } else {
+                            onEdit(slot)
+                        }
+                    },
+                    onDelete = {
+                        if (showingTemp && tempSchedule != null) {
+                            onUpdateTempSchedule(tempSchedule.copy(slots = tempSchedule.slots.filter { it.id != slot.id }))
+                        } else {
+                            onDelete(slot)
+                        }
+                    }
+                )
             }
         }
+
+        if (slots.isNotEmpty() && !showingTemp) {
+            Spacer(Modifier.height(10.dp))
+            NeoButton("DELETE MAIN TIMETABLE", Red) {
+                showClearDialog = true
+            }
+        }
+    }
+
+    if (showClearDialog) {
+        Dialog(onDismissRequest = { showClearDialog = false }) {
+            Box(Modifier.padding(end = 6.dp, bottom = 6.dp)) {
+                Column(
+                    Modifier
+                        .neoShadow(6.dp)
+                        .background(Yellow)
+                        .border(3.dp, Ink)
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Text("DELETE TIMETABLE?", fontWeight = FontWeight.Black, fontSize = 20.sp)
+                    Text(
+                        "This will delete all ${slots.size} classes from your main timetable.\n\nYour subjects and attendance records will NOT be deleted.",
+                        fontWeight = FontWeight.Bold, fontSize = 13.sp
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        NeoButton("CANCEL", White, Modifier.weight(1f)) { showClearDialog = false }
+                        NeoButton("DELETE ALL", Red, Modifier.weight(1f)) {
+                            onClearAll()
+                            showClearDialog = false
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showTempDialog) {
+        TemporaryScheduleDialog(
+            initial = tempSchedule,
+            regularSlots = slots,
+            subjectNames = subjectNames,
+            onDismiss = { showTempDialog = false },
+            onSave = {
+                onUpdateTempSchedule(it)
+                showTempDialog = false
+            },
+            onDelete = {
+                onUpdateTempSchedule(null)
+                showTempDialog = false
+            }
+        )
+    }
+}
+
+@Composable
+fun TemporaryScheduleDialog(
+    initial: TemporarySchedule?,
+    regularSlots: List<ClassSlot>,
+    subjectNames: List<String>,
+    onDismiss: () -> Unit,
+    onSave: (TemporarySchedule) -> Unit,
+    onDelete: () -> Unit
+) {
+    val context = LocalContext.current
+    val today = remember { epochDayOf(System.currentTimeMillis()) }
+    var startDay by remember { mutableStateOf(initial?.startDay ?: today) }
+    var endDay by remember { mutableStateOf(initial?.endDay ?: (today + 1)) }
+    var slots by remember { mutableStateOf(initial?.slots ?: emptyList()) }
+
+    val daysInRange = remember(startDay, endDay) {
+        val list = mutableListOf<Long>()
+        var d = startDay
+        while (d <= endDay && list.size < 14) {
+            list.add(d)
+            d++
+        }
+        list
+    }
+    var selectedDayEpoch by remember { mutableStateOf(startDay.coerceIn(startDay, endDay)) }
+    LaunchedEffect(daysInRange) {
+        if (selectedDayEpoch !in daysInRange) {
+            selectedDayEpoch = daysInRange.firstOrNull() ?: startDay
+        }
+    }
+
+    val selectedWeekday = weekdayOf(selectedDayEpoch)
+    val daySlots = slots.filter { it.day == selectedWeekday }.sortedBy { it.start }
+
+    var editingSlot by remember { mutableStateOf<ClassSlot?>(null) }
+    var showSlotDialog by remember { mutableStateOf(false) }
+    var showImportDialog by remember { mutableStateOf(false) }
+
+    fun pickDate(current: Long, onPicked: (Long) -> Unit) {
+        val (y, m, d) = ymdOf(current)
+        DatePickerDialog(context, { _, yy, mm, dd ->
+            onPicked(dayOfYmd(yy, mm, dd))
+        }, y, m, d).show()
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Box(Modifier.padding(end = 6.dp, bottom = 6.dp)) {
+            Column(
+                Modifier
+                    .neoShadow(6.dp)
+                    .background(Mint)
+                    .border(3.dp, Ink)
+                    .verticalScroll(rememberScrollState())
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Text("TEMPORARY SCHEDULE", fontWeight = FontWeight.Black, fontSize = 22.sp)
+                Text(
+                    "Set a special routine for 1-2 days. It runs during these dates and auto-reverts to your regular timetable after.",
+                    fontWeight = FontWeight.Bold, fontSize = 13.sp
+                )
+
+                // Quick presets
+                Column {
+                    FieldLabel("QUICK PRESETS")
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        SemChip("TODAY", startDay == today && endDay == today, White) {
+                            startDay = today
+                            endDay = today
+                            selectedDayEpoch = today
+                        }
+                        SemChip("TOMORROW", startDay == today + 1 && endDay == today + 1, White) {
+                            startDay = today + 1
+                            endDay = today + 1
+                            selectedDayEpoch = today + 1
+                        }
+                        SemChip("2 DAYS", startDay == today && endDay == today + 1, Lime) {
+                            startDay = today
+                            endDay = today + 1
+                            selectedDayEpoch = today
+                        }
+                    }
+                }
+
+                // Date pickers
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Column(Modifier.weight(1f)) {
+                        FieldLabel("FROM DATE")
+                        NeoButton(dateText(startDay), White) {
+                            pickDate(startDay) {
+                                startDay = it
+                                if (endDay < it) endDay = it
+                            }
+                        }
+                    }
+                    Column(Modifier.weight(1f)) {
+                        FieldLabel("TO DATE")
+                        NeoButton(dateText(endDay), White) {
+                            pickDate(endDay) {
+                                endDay = it
+                                if (startDay > it) startDay = it
+                            }
+                        }
+                    }
+                }
+
+                // Days tabs
+                Column {
+                    FieldLabel("SELECT DAY TO EDIT CLASSES")
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(daysInRange) { d ->
+                            val isSel = d == selectedDayEpoch
+                            val label = "${DAY_SHORT[weekdayOf(d) - 1]} (${dateText(d).substringAfter(" ")})"
+                            SemChip(label, isSel, Sky) { selectedDayEpoch = d }
+                        }
+                    }
+                }
+
+                // Classes on selected day
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "CLASSES (${DAY_FULL[selectedWeekday - 1].uppercase()})",
+                            fontWeight = FontWeight.Black, fontSize = 13.sp
+                        )
+                        val regularForThisDay = regularSlots.filter { it.day == selectedWeekday }
+                        if (regularForThisDay.isNotEmpty() && daySlots.isEmpty()) {
+                            Text(
+                                "COPY REGULAR SLOTS",
+                                fontWeight = FontWeight.Black, fontSize = 12.sp, color = Ink,
+                                modifier = Modifier
+                                    .background(Yellow)
+                                    .border(2.dp, Ink)
+                                    .clickable {
+                                        val base = System.currentTimeMillis()
+                                        val copied = regularForThisDay.mapIndexed { idx, s ->
+                                            s.copy(id = base + idx)
+                                        }
+                                        slots = slots + copied
+                                    }
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+
+                    if (daySlots.isEmpty()) {
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .background(White)
+                                .border(2.dp, Ink)
+                                .padding(12.dp)
+                        ) {
+                            Text("No classes added for this day yet.", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        }
+                    } else {
+                        daySlots.forEach { s ->
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .background(White)
+                                    .border(2.dp, Ink)
+                                    .padding(8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        "${s.subject.uppercase()}${if (s.isLab) " (LAB)" else ""}",
+                                        fontWeight = FontWeight.Black, fontSize = 14.sp
+                                    )
+                                    Text(
+                                        "${formatTime(s.start)} - ${formatTime(s.end)}${if (s.room.isNotBlank()) " - Room ${s.room}" else ""}",
+                                        fontWeight = FontWeight.Bold, fontSize = 12.sp
+                                    )
+                                }
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Box(
+                                        Modifier
+                                            .background(Sky)
+                                            .border(2.dp, Ink)
+                                            .clickable {
+                                                editingSlot = s
+                                                showSlotDialog = true
+                                            }
+                                            .padding(horizontal = 8.dp, vertical = 3.dp)
+                                    ) { Text("EDIT", fontWeight = FontWeight.Black, fontSize = 11.sp) }
+                                    Box(
+                                        Modifier
+                                            .background(Red)
+                                            .border(2.dp, Ink)
+                                            .clickable {
+                                                slots = slots.filter { it.id != s.id }
+                                            }
+                                            .padding(horizontal = 8.dp, vertical = 3.dp)
+                                    ) { Text("X", fontWeight = FontWeight.Black, fontSize = 11.sp, color = White) }
+                                }
+                            }
+                        }
+                    }
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        NeoButton("IMPORT TIMETABLE", Sky, Modifier.weight(1f)) {
+                            showImportDialog = true
+                        }
+                        NeoButton("+ ADD CLASS", Yellow, Modifier.weight(1f)) {
+                            editingSlot = null
+                            showSlotDialog = true
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(4.dp))
+                NeoButton("SAVE & ACTIVATE", Lime) {
+                    onSave(
+                        TemporarySchedule(
+                            id = initial?.id ?: System.currentTimeMillis(),
+                            startDay = startDay,
+                            endDay = endDay,
+                            slots = slots,
+                            active = true
+                        )
+                    )
+                }
+
+                if (initial != null) {
+                    NeoButton("DELETE / REVERT NOW", Red, onClick = onDelete)
+                }
+
+                NeoButton("CLOSE", White, onClick = onDismiss)
+            }
+        }
+    }
+
+    if (showImportDialog) {
+        TimetableImportDialog(
+            title = "IMPORT TEMPORARY TIMETABLE",
+            defaultDay = selectedWeekday,
+            subjectNames = subjectNames,
+            onDismiss = { showImportDialog = false },
+            onApply = { parsed ->
+                var list = slots
+                val base = System.currentTimeMillis()
+                parsed.forEachIndexed { i, p ->
+                    val duplicate = list.any {
+                        it.day == p.day && it.start == p.start && normName(it.subject) == normName(p.subject)
+                    }
+                    if (!duplicate) {
+                        list = list + ClassSlot(base + i, p.day, p.start, p.end, p.subject, p.isLab, p.room, p.teacher)
+                    }
+                }
+                slots = list
+                showImportDialog = false
+            }
+        )
+    }
+
+    if (showSlotDialog) {
+        SlotDialog(
+            initial = editingSlot,
+            defaultDay = selectedWeekday,
+            subjectNames = subjectNames,
+            onDismiss = {
+                showSlotDialog = false
+                editingSlot = null
+            },
+            onSave = { days, start, end, subject, isLab, room, teacher ->
+                val old = editingSlot
+                var list = if (old != null) slots.filter { it.id != old.id } else slots
+                val base = System.currentTimeMillis()
+                days.sorted().forEachIndexed { i, d ->
+                    list = list + ClassSlot(base + i, d, start, end, subject, isLab, room, teacher)
+                }
+                slots = list
+                showSlotDialog = false
+                editingSlot = null
+            }
+        )
     }
 }
 
@@ -2591,7 +3242,7 @@ fun SlotDialog(
                 error?.let { Text(it, fontWeight = FontWeight.Black) }
 
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    NeoButton("CANCEL", White, Modifier.weight(1f), onDismiss)
+                    NeoButton("CANCEL", White, Modifier.weight(1f), onClick = onDismiss)
                     NeoButton("SAVE", Lime, Modifier.weight(1f)) {
                         when {
                             subject.isBlank() -> error = "Enter a subject name."
@@ -2614,6 +3265,8 @@ class SlotImportRow(val slot: ParsedSlot) {
 @Composable
 fun TimetableImportDialog(
     subjectNames: List<String>,
+    title: String = "IMPORT TIMETABLE",
+    defaultDay: Int? = null,
     onDismiss: () -> Unit,
     onApply: (List<ParsedSlot>) -> Unit
 ) {
@@ -2645,7 +3298,7 @@ fun TimetableImportDialog(
 
     fun handleText(text: String?) {
         skipped = ""
-        handleSlots(if (text.isNullOrBlank()) emptyList() else parseTimetableText(text))
+        handleSlots(if (text.isNullOrBlank()) emptyList() else parseTimetableText(text, defaultDay))
     }
 
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
@@ -2682,7 +3335,7 @@ fun TimetableImportDialog(
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Text("IMPORT TIMETABLE", fontWeight = FontWeight.Black, fontSize = 22.sp)
+                Text(title, fontWeight = FontWeight.Black, fontSize = 22.sp)
 
                 if (stage == 0) {
                     if (pasting) {
@@ -2898,7 +3551,7 @@ fun SemesterDialog(
                     ) { if (confirm) onDelete() else confirm = true }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    NeoButton("CANCEL", White, Modifier.weight(1f), onDismiss)
+                    NeoButton("CANCEL", White, Modifier.weight(1f), onClick = onDismiss)
                     NeoButton("SAVE", Lime, Modifier.weight(1f)) {
                         if (name.isBlank()) error = "Enter a semester name." else onSave(name.trim())
                     }
@@ -3369,8 +4022,11 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
     var showSlotDialog by remember { mutableStateOf(false) }
     var editingSlot by remember { mutableStateOf<ClassSlot?>(null) }
     var showSlotImport by remember { mutableStateOf(false) }
+    var showImportChoice by remember { mutableStateOf(false) }
+    var showTempImport by remember { mutableStateOf(false) }
     var showPlanner by remember { mutableStateOf(false) }
     var showDaysOff by remember { mutableStateOf(false) }
+    var showAttendanceHistory by remember { mutableStateOf(false) }
     var showExamDialog by remember { mutableStateOf(false) }
     var editingExam by remember { mutableStateOf<Exam?>(null) }
     var showExamImport by remember { mutableStateOf(false) }
@@ -3380,6 +4036,7 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
     var semDialog by remember { mutableStateOf(0) } // 0 = none, 1 = new semester, 2 = edit semester
     var tab by rememberSaveable { mutableStateOf(0) } // 0 = THEORY, 1 = LAB
     var examTab by rememberSaveable { mutableStateOf(0) } // 0 = SCHEDULE, 1 = MARKS
+    var showShareDialog by remember { mutableStateOf(false) } // Timetable/Datesheet sharing
 
     // A PRESENT / ABSENT press on a notification saves in the background; reload so the screen (and later saves) stay current.
     DisposableEffect(user.uid) {
@@ -3428,6 +4085,11 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
         commit(data.copy(semesters = data.semesters.map { if (it.id == current.id) it.copy(slots = new) else it }))
     }
 
+    /** Saves a temporary schedule into the selected semester. */
+    fun updateTempSchedule(new: TemporarySchedule?) {
+        commit(data.copy(semesters = data.semesters.map { if (it.id == current.id) it.copy(tempSchedule = new) else it }))
+    }
+
     /** Saves the exams of the selected semester. */
     fun updateExams(new: List<Exam>) {
         commit(data.copy(semesters = data.semesters.map { if (it.id == current.id) it.copy(exams = new) else it }))
@@ -3439,13 +4101,15 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
     }
 
     // Keep the reminder alarm in step with the selected semester's timetable.
-    LaunchedEffect(current.id, current.slots, current.daysOff, current.exams) {
+    LaunchedEffect(current.id, current.slots, current.daysOff, current.exams, current.tempSchedule) {
         Reminders.saveSlots(context, current.slots)
+        Reminders.saveTempSchedule(context, current.tempSchedule)
         Reminders.saveDaysOff(context, current.daysOff)
+        ExamReminders.saveExams(context, current.exams)
         Reminders.scheduleNext(context)
         ClassEndAlerts.scheduleNext(context)
-        ExamReminders.saveExams(context, current.exams)
         ExamReminders.scheduleNext(context)
+        BunkrWidget.refreshAll(context)
     }
 
     // Leave that counts as present is added to the attendance as each of its classes ends.
@@ -3478,7 +4142,9 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
             val sumA = tracked.sumOf { it.attended }
             val sumT = tracked.sumOf { it.total }
             val safeCount = tracked.count { it.isSafe }
-            val next = remember(current.slots) { nextClass(current.slots, System.currentTimeMillis()) }
+            val next = remember(current.slots, current.tempSchedule, current.daysOff, current.exams) {
+                nextClass(current.slots, current.tempSchedule, System.currentTimeMillis(), current.daysOff, current.exams)
+            }
             val overallFraction = if (sumT == 0) 0f else sumA.toFloat() / sumT
             val requiredFraction = if (tracked.isEmpty()) 0.75f else tracked.map { it.required }.average().toFloat() / 100f
             val statusText = when {
@@ -3522,11 +4188,17 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
             if (screen == 1) {
                 TimetableScreen(
                     slots = current.slots,
+                    tempSchedule = current.tempSchedule,
+                    exams = current.exams,
+                    daysOff = current.daysOff,
+                    subjectNames = subjects.map { it.name },
                     onEdit = {
                         editingSlot = it
                         showSlotDialog = true
                     },
-                    onDelete = { slot -> updateSlots(current.slots.filter { it.id != slot.id }) }
+                    onDelete = { slot -> updateSlots(current.slots.filter { it.id != slot.id }) },
+                    onClearAll = { updateSlots(emptyList()) },
+                    onUpdateTempSchedule = { updateTempSchedule(it) }
                 )
             } else if (screen == 2) {
                 Row(
@@ -3566,9 +4238,35 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
                 ) {
                     OverallCard(subjects, tab)
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        NeoButton("SKIP PLANNER", Sky, Modifier.weight(1f)) { showPlanner = true }
-                        NeoButton("HOLIDAYS & LEAVE", Yellow, Modifier.weight(1f)) { showDaysOff = true }
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        NeoButton(
+                            text = "HISTORY",
+                            color = Lime,
+                            modifier = Modifier.weight(1f),
+                            fontSize = 11.5.sp,
+                            maxLines = 1,
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 10.dp)
+                        ) { showAttendanceHistory = true }
+                        NeoButton(
+                            text = "PLANNER",
+                            color = Sky,
+                            modifier = Modifier.weight(1f),
+                            fontSize = 11.5.sp,
+                            maxLines = 1,
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 10.dp)
+                        ) { showPlanner = true }
+                        NeoButton(
+                            text = "HOLIDAYS",
+                            color = Yellow,
+                            modifier = Modifier.weight(1f),
+                            fontSize = 11.5.sp,
+                            maxLines = 1,
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 10.dp)
+                        ) { showDaysOff = true }
                     }
 
                     if (visible.isEmpty()) {
@@ -3602,6 +4300,22 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
                                     val updated = if (tab == 0) s.copy(theory = null) else s.copy(lab = null)
                                     if (updated.theory == null && updated.lab == null) update(subjects.filter { it.id != s.id })
                                     else update(subjects.map { if (it.id == s.id) updated else it })
+                                },
+                                onAction = { action, isLab ->
+                                    val today = epochDayOf(System.currentTimeMillis())
+                                    val newStatus = when (action) {
+                                        "P" -> "P"
+                                        "A" -> "A"
+                                        else -> null
+                                    }
+                                    val updatedSem = recordAttendanceLog(
+                                        semester = current,
+                                        day = today,
+                                        subjectId = s.id,
+                                        isLab = isLab,
+                                        newStatus = newStatus
+                                    )
+                                    commit(data.copy(semesters = data.semesters.map { if (it.id == current.id) updatedSem else it }))
                                 }
                             )
                         }
@@ -3619,25 +4333,38 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
         ) {
             when (screen) {
                 0 -> {
-                    NeoButton("IMPORT", Sky, Modifier.weight(1f)) { showImport = true }
-                    NeoButton("+ ADD SUBJECT", Lime, Modifier.weight(1f)) { showAdd = true }
+                    NeoButton("IMPORT", Sky, Modifier.weight(1f), fontSize = 12.sp, maxLines = 1, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 10.dp)) { showImport = true }
+                    NeoButton("+ ADD SUBJECT", Lime, Modifier.weight(1f), fontSize = 12.sp, maxLines = 1, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 10.dp)) { showAdd = true }
                 }
                 1 -> {
-                    NeoButton("IMPORT", Sky, Modifier.weight(1f)) { showSlotImport = true }
-                    NeoButton("+ ADD CLASS", Lime, Modifier.weight(1f)) {
+                    NeoButton("IMPORT", Sky, Modifier.weight(1f), fontSize = 12.sp, maxLines = 1, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 10.dp)) {
+                        val today = epochDayOf(System.currentTimeMillis())
+                        if (current.tempSchedule != null && current.tempSchedule.covers(today)) {
+                            showImportChoice = true
+                        } else {
+                            showSlotImport = true
+                        }
+                    }
+                    if (current.slots.isNotEmpty()) {
+                        NeoButton("SHARE ↗", Mint, Modifier.weight(1f), fontSize = 12.sp, maxLines = 1, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 10.dp)) { showShareDialog = true }
+                    }
+                    NeoButton("+ ADD CLASS", Lime, Modifier.weight(1f), fontSize = 12.sp, maxLines = 1, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 10.dp)) {
                         editingSlot = null
                         showSlotDialog = true
                     }
                 }
                 2 -> {
                     if (examTab == 0) {
-                        NeoButton("DATESHEET", Sky, Modifier.weight(1f)) { showExamImport = true }
-                        NeoButton("+ ADD EXAM", Lime, Modifier.weight(1f)) {
+                        NeoButton("DATESHEET", Sky, Modifier.weight(1f), fontSize = 12.sp, maxLines = 1, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 10.dp)) { showExamImport = true }
+                        if (current.exams.isNotEmpty()) {
+                            NeoButton("SHARE ↗", Mint, Modifier.weight(1f), fontSize = 12.sp, maxLines = 1, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 10.dp)) { showShareDialog = true }
+                        }
+                        NeoButton("+ ADD EXAM", Lime, Modifier.weight(1f), fontSize = 12.sp, maxLines = 1, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 10.dp)) {
                             editingExam = null
                             showExamDialog = true
                         }
                     } else {
-                        NeoButton("+ ENTER MARKS", Lime, Modifier.fillMaxWidth()) {
+                        NeoButton("+ ENTER MARKS", Lime, Modifier.fillMaxWidth(), fontSize = 12.sp, maxLines = 1, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 10.dp)) {
                             showMarksDialog = true
                         }
                     }
@@ -3661,6 +4388,16 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
 
     if (showPlanner) {
         SkipPlannerDialog(semester = current, onDismiss = { showPlanner = false })
+    }
+
+    if (showAttendanceHistory) {
+        AttendanceHistoryDialog(
+            semester = current,
+            onDismiss = { showAttendanceHistory = false },
+            onUpdateSemester = { updated ->
+                commit(data.copy(semesters = data.semesters.map { if (it.id == current.id) updated else it }))
+            }
+        )
     }
 
     if (showDaysOff) {
@@ -3763,6 +4500,65 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
         )
     }
 
+    if (showImportChoice) {
+        Dialog(onDismissRequest = { showImportChoice = false }) {
+            Box(Modifier.padding(end = 6.dp, bottom = 6.dp)) {
+                Column(
+                    Modifier
+                        .neoShadow(6.dp)
+                        .background(Yellow)
+                        .border(3.dp, Ink)
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Text("IMPORT TIMETABLE", fontWeight = FontWeight.Black, fontSize = 20.sp)
+                    Text(
+                        "Temporary schedule is active today. Which timetable do you want to import for?",
+                        fontWeight = FontWeight.Bold, fontSize = 13.sp
+                    )
+                    NeoButton("TEMPORARY SCHEDULE", Mint) {
+                        showImportChoice = false
+                        showTempImport = true
+                    }
+                    NeoButton("MAIN TIMETABLE", Sky) {
+                        showImportChoice = false
+                        showSlotImport = true
+                    }
+                    NeoButton("CANCEL", White) { showImportChoice = false }
+                }
+            }
+        }
+    }
+
+    if (showTempImport) {
+        val today = epochDayOf(System.currentTimeMillis())
+        val defaultD = current.tempSchedule?.let { weekdayOf(it.startDay) } ?: todayIndex()
+        TimetableImportDialog(
+            title = "IMPORT TEMPORARY TIMETABLE",
+            defaultDay = defaultD,
+            subjectNames = subjects.map { it.name },
+            onDismiss = { showTempImport = false },
+            onApply = { parsed ->
+                val base = System.currentTimeMillis()
+                val temp = current.tempSchedule ?: TemporarySchedule(
+                    startDay = today,
+                    endDay = today + 1
+                )
+                var list = temp.slots
+                parsed.forEachIndexed { i, p ->
+                    val duplicate = list.any {
+                        it.day == p.day && it.start == p.start && normName(it.subject) == normName(p.subject)
+                    }
+                    if (!duplicate) {
+                        list = list + ClassSlot(base + i, p.day, p.start, p.end, p.subject, p.isLab, p.room, p.teacher)
+                    }
+                }
+                updateTempSchedule(temp.copy(slots = list, active = true))
+                showTempImport = false
+            }
+        )
+    }
+
     if (showImport) {
         ImportDialog(
             semesterName = current.name,
@@ -3796,6 +4592,36 @@ fun BunkrApp(user: FirebaseUser, onLogout: () -> Unit) {
                 update(list)
                 tab = if (rows.all { it.isLab }) 1 else 0
                 showImport = false
+            }
+        )
+    }
+
+    if (showShareDialog) {
+        TimetableShareDialog(
+            slots = current.slots,
+            exams = current.exams,
+            onDismiss = { showShareDialog = false },
+            onImport = { importedSlots, importedExams ->
+                // Merge imported slots (skip duplicates by day+start+subject)
+                if (importedSlots.isNotEmpty()) {
+                    val base = System.currentTimeMillis()
+                    var list = current.slots
+                    importedSlots.forEachIndexed { i, p ->
+                        val dup = list.any { it.day == p.day && it.start == p.start && normName(it.subject) == normName(p.subject) }
+                        if (!dup) list = list + ClassSlot(base + i, p.day, p.start, p.end, p.subject, p.isLab, p.room, p.teacher)
+                    }
+                    updateSlots(list)
+                }
+                // Merge imported exams (skip duplicates by subject+type+day)
+                if (importedExams.isNotEmpty()) {
+                    val base = System.currentTimeMillis()
+                    var list = current.exams
+                    importedExams.forEachIndexed { i, e ->
+                        val dup = list.any { it.subject == e.subject && it.type == e.type && it.day == e.day }
+                        if (!dup) list = list + e.copy(id = base + i)
+                    }
+                    updateExams(list)
+                }
             }
         )
     }
@@ -3963,7 +4789,8 @@ fun SubjectCard(
     tab: Int,
     onChange: (Subject) -> Unit,
     onEdit: () -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    onAction: ((action: String, isLab: Boolean) -> Unit)? = null
 ) {
     NeoCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -3992,16 +4819,30 @@ fun SubjectCard(
 
         Spacer(Modifier.height(12.dp))
         if (tab == 0) {
-            s.theory?.let { th -> SectionBlock("THEORY", Sky, th) { onChange(s.copy(theory = it)) } }
+            s.theory?.let { th ->
+                SectionBlock("THEORY", Sky, th, onAction = { act -> onAction?.invoke(act, false) }) {
+                    onChange(s.copy(theory = it))
+                }
+            }
         } else {
-            s.lab?.let { lab -> SectionBlock("LAB", Pink, lab) { onChange(s.copy(lab = it)) } }
+            s.lab?.let { lab ->
+                SectionBlock("LAB", Pink, lab, onAction = { act -> onAction?.invoke(act, true) }) {
+                    onChange(s.copy(lab = it))
+                }
+            }
         }
     }
 }
 
 /** One self-contained section (theory or lab) with its own numbers and buttons. */
 @Composable
-fun SectionBlock(title: String, tagColor: Color, r: Record, onChange: (Record) -> Unit) {
+fun SectionBlock(
+    title: String,
+    tagColor: Color,
+    r: Record,
+    onAction: ((String) -> Unit)? = null,
+    onChange: (Record) -> Unit
+) {
     val barColor = when {
         r.total == 0 -> Sky
         r.isSafe -> Lime
@@ -4052,12 +4893,24 @@ fun SectionBlock(title: String, tagColor: Color, r: Record, onChange: (Record) -
 
         Spacer(Modifier.height(12.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            NeoButton("PRESENT", Lime, Modifier.weight(1f)) { onChange(r.present()) }
-            NeoButton("ABSENT", Pink, Modifier.weight(1f)) { onChange(r.absent()) }
+            NeoButton("PRESENT", Lime, Modifier.weight(1f)) {
+                onAction?.invoke("P")
+                onChange(r.present())
+            }
+            NeoButton("ABSENT", Pink, Modifier.weight(1f)) {
+                onAction?.invoke("A")
+                onChange(r.absent())
+            }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            NeoButton("UNDO P", White, Modifier.weight(1f)) { onChange(r.undoPresent()) }
-            NeoButton("UNDO A", White, Modifier.weight(1f)) { onChange(r.undoAbsent()) }
+            NeoButton("UNDO P", White, Modifier.weight(1f)) {
+                onAction?.invoke("UP")
+                onChange(r.undoPresent())
+            }
+            NeoButton("UNDO A", White, Modifier.weight(1f)) {
+                onAction?.invoke("UA")
+                onChange(r.undoAbsent())
+            }
         }
     }
 }
